@@ -37,6 +37,7 @@ COPY levelup_card.py .
 COPY ticket_banner.png .
 COPY reglement_banner.png .
 COPY taverne_bg.png .
+COPY welcome_bg.gif .
 
 # Dossier de données persistantes (monté comme volume)
 RUN mkdir -p /app/data
