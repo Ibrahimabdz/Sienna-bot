@@ -1,0 +1,31 @@
+# ════════════════════════════════════════════════════════════════
+#  docker-compose.yml — Sienna Bot (test local)
+# ════════════════════════════════════════════════════════════════
+
+version: "3.9"
+
+services:
+  sienna-bot:
+    build: .
+    container_name: sienna-taverne
+    restart: unless-stopped
+
+    # Variables d'environnement — copie ton .env ici
+    env_file:
+      - .env
+
+    # Volume persistant pour data.json
+    volumes:
+      - sienna_data:/app/data
+
+    # Logs lisibles
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Volume nommé (persiste entre les redémarrages)
+volumes:
+  sienna_data:
+    driver: local

@@ -1,0 +1,33 @@
+# ════════════════════════════════════════════════════════════════
+#  .dockerignore — fichiers exclus du build Docker
+# ════════════════════════════════════════════════════════════════
+
+# Fichiers sensibles
+.env
+*.env
+
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Données locales (le volume Docker s'en charge)
+data.json
+data/
+
+# Git
+.git/
+.gitignore
+
+# Docs
+*.md
+README*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs locaux
+*.log
