@@ -34,7 +34,8 @@ COPY welcome_card.py .
 COPY levelup_card.py .
 
 # Copier les assets (images)
-COPY ticket_banner.png .
+COPY ticket_banner.jpg .
+COPY ticket_banner.png* ./
 COPY reglement_banner.png .
 COPY taverne_bg.png .
 COPY welcome_bg.gif .
