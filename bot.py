@@ -3212,6 +3212,148 @@ async def on_interaction(interaction: discord.Interaction):
     await send_log(interaction.guild, embed)
 
 
+
+# ════════════════════════════════════════════════════════════════
+#  🎭  SELF ROLES — Couleurs & Notifications
+# ════════════════════════════════════════════════════════════════
+
+import os as _os_sr
+
+def _sr_banner_path():
+    for p in [
+        _os_sr.path.join(_os_sr.path.dirname(_os_sr.path.abspath(__file__)), "selfroles_banner.png"),
+        _os_sr.path.join(_os_sr.getcwd(), "selfroles_banner.png"),
+    ]:
+        if _os_sr.path.exists(p):
+            return p
+    return None
+
+
+# ── Panel 1 : Couleurs ──────────────────────────────────────────
+class CouleurRolesView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _toggle(self, interaction: discord.Interaction, role_name: str, emoji: str):
+        role = discord.utils.get(interaction.guild.roles, name=role_name)
+        if not role:
+            await interaction.response.send_message(
+                f"❌ Rôle **{role_name}** introuvable. Crée-le d'abord sur Discord.",
+                ephemeral=True
+            )
+            return
+        if role in interaction.user.roles:
+            await interaction.user.remove_roles(role)
+            await interaction.response.send_message(
+                f"{emoji} Rôle **{role_name}** retiré !", ephemeral=True
+            )
+        else:
+            await interaction.user.add_roles(role)
+            await interaction.response.send_message(
+                f"{emoji} Rôle **{role_name}** obtenu !", ephemeral=True
+            )
+
+    @discord.ui.button(label="🔴 Rouge",   style=discord.ButtonStyle.danger,   custom_id="role_rouge",  row=0)
+    async def role_rouge(self, i, b): await self._toggle(i, "Rouge", "🔴")
+
+    @discord.ui.button(label="🟠 Orange",  style=discord.ButtonStyle.danger,   custom_id="role_orange", row=0)
+    async def role_orange(self, i, b): await self._toggle(i, "Orange", "🟠")
+
+    @discord.ui.button(label="🟡 Jaune",   style=discord.ButtonStyle.secondary,custom_id="role_jaune",  row=0)
+    async def role_jaune(self, i, b): await self._toggle(i, "Jaune", "🟡")
+
+    @discord.ui.button(label="🟢 Vert",    style=discord.ButtonStyle.success,  custom_id="role_vert",   row=1)
+    async def role_vert(self, i, b): await self._toggle(i, "Vert", "🟢")
+
+    @discord.ui.button(label="🔵 Bleu",    style=discord.ButtonStyle.primary,  custom_id="role_bleu",   row=1)
+    async def role_bleu(self, i, b): await self._toggle(i, "Bleu", "🔵")
+
+    @discord.ui.button(label="🟣 Violet",  style=discord.ButtonStyle.primary,  custom_id="role_violet", row=1)
+    async def role_violet(self, i, b): await self._toggle(i, "Violet", "🟣")
+
+    @discord.ui.button(label="🩷 Rose",    style=discord.ButtonStyle.secondary,custom_id="role_rose",   row=2)
+    async def role_rose(self, i, b): await self._toggle(i, "Rose", "🩷")
+
+
+# ── Panel 2 : Notifications ─────────────────────────────────────
+class NotifRolesView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _toggle(self, interaction: discord.Interaction, role_name: str, emoji: str):
+        role = discord.utils.get(interaction.guild.roles, name=role_name)
+        if not role:
+            await interaction.response.send_message(
+                f"❌ Rôle **{role_name}** introuvable. Crée-le d'abord sur Discord.",
+                ephemeral=True
+            )
+            return
+        if role in interaction.user.roles:
+            await interaction.user.remove_roles(role)
+            await interaction.response.send_message(
+                f"{emoji} Rôle **{role_name}** retiré !", ephemeral=True
+            )
+        else:
+            await interaction.user.add_roles(role)
+            await interaction.response.send_message(
+                f"{emoji} Rôle **{role_name}** obtenu !", ephemeral=True
+            )
+
+    @discord.ui.button(label="🔔 Ping Animation", style=discord.ButtonStyle.primary,  custom_id="role_ping_anim", row=0)
+    async def role_ping_anim(self, i, b): await self._toggle(i, "Ping Animation", "🔔")
+
+    @discord.ui.button(label="🎬 Animation",       style=discord.ButtonStyle.success,  custom_id="role_animation", row=0)
+    async def role_animation(self, i, b): await self._toggle(i, "Animation", "🎬")
+
+
+# ── Commandes ───────────────────────────────────────────────────
+@tree.command(name="rolecouleurpanel", description="[Admin] Envoie le panel de rôles couleurs")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_rolecouleurpanel(interaction: discord.Interaction):
+    banner = _sr_banner_path()
+    embed = discord.Embed(
+        title="🎨 Choisis ta couleur",
+        description=(
+            "Clique sur un bouton pour obtenir ou retirer un rôle de couleur.\n\n"
+            "🔴 **Rouge** • 🟠 **Orange** • 🟡 **Jaune**\n"
+            "🟢 **Vert** • 🔵 **Bleu** • 🟣 **Violet** • 🩷 **Rose**\n\n"
+            "*Clique à nouveau pour retirer le rôle.*"
+        ),
+        color=0x8B0000
+    )
+    embed.set_footer(text="Un seul rôle couleur à la fois recommandé • La Taverne")
+    if banner:
+        file = discord.File(banner, filename="selfroles_banner.png")
+        embed.set_image(url="attachment://selfroles_banner.png")
+        await interaction.channel.send(embed=embed, file=file, view=CouleurRolesView())
+    else:
+        await interaction.channel.send(embed=embed, view=CouleurRolesView())
+    await interaction.response.send_message("✅ Panel couleurs envoyé !", ephemeral=True)
+
+
+@tree.command(name="rolenotifpanel", description="[Admin] Envoie le panel de rôles notifications")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_rolenotifpanel(interaction: discord.Interaction):
+    banner = _sr_banner_path()
+    embed = discord.Embed(
+        title="🔔 Choisis tes notifications",
+        description=(
+            "Clique sur un bouton pour activer ou désactiver tes notifications.\n\n"
+            "🔔 **Ping Animation** — Reçois un ping lors des nouvelles animations\n"
+            "🎬 **Animation** — Accède aux salons d'animation\n\n"
+            "*Clique à nouveau pour retirer le rôle.*"
+        ),
+        color=0x2C2F33
+    )
+    embed.set_footer(text="Gère tes notifications • La Taverne")
+    if banner:
+        file = discord.File(banner, filename="selfroles_banner.png")
+        embed.set_image(url="attachment://selfroles_banner.png")
+        await interaction.channel.send(embed=embed, file=file, view=NotifRolesView())
+    else:
+        await interaction.channel.send(embed=embed, view=NotifRolesView())
+    await interaction.response.send_message("✅ Panel notifications envoyé !", ephemeral=True)
+
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
