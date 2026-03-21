@@ -3241,15 +3241,25 @@ def pendu_afficher(etat: dict) -> str:
 
 @tree.command(name="pendu", description="🪢 Lance une partie de Pendu")
 async def slash_pendu(interaction: discord.Interaction):
+    ch_id = interaction.channel_id
+    if ch_id in pendu_parties:
+        partie = pendu_parties[ch_id]
+        await interaction.response.send_message(
+            f"❌ Une partie de pendu est déjà en cours dans ce salon avec <@{partie['user_id']}>.",
+            ephemeral=True
+        )
+        return
     import random as _r
     mot = _r.choice(PENDU_MOTS).lower()
-    pendu_parties[interaction.channel_id] = {
+    pendu_parties[ch_id] = {
         "mot": mot, "trouve": set(), "erreurs": 0,
         "lettres_essayees": set(), "user_id": interaction.user.id
     }
-    etat  = pendu_parties[interaction.channel_id]
+    etat  = pendu_parties[ch_id]
     embed = discord.Embed(title="🪢 Pendu — La Taverne", description=pendu_afficher(etat), color=0x8B0000)
-    embed.set_footer(text="Tape /pendu_lettre [lettre] pour jouer !")
+    embed.add_field(name="Joueur", value=interaction.user.mention, inline=True)
+    embed.add_field(name="Contrôle", value="`/pendu_lettre` ou `/pendu_stop`", inline=True)
+    embed.set_footer(text="Seul le joueur ayant lancé la partie peut proposer une lettre.")
     await interaction.response.send_message(embed=embed)
 
 @tree.command(name="pendu_lettre", description="🪢 Propose une lettre au Pendu")
@@ -3260,6 +3270,9 @@ async def slash_pendu_lettre(interaction: discord.Interaction, lettre: str):
         await interaction.response.send_message("❌ Aucune partie en cours. Lance `/pendu` !", ephemeral=True)
         return
     etat   = pendu_parties[ch_id]
+    if interaction.user.id != etat["user_id"]:
+        await interaction.response.send_message("❌ Cette partie ne t'appartient pas.", ephemeral=True)
+        return
     lettre = lettre.lower().strip()
     if len(lettre) != 1 or not lettre.isalpha():
         await interaction.response.send_message("❌ Entre une seule lettre !", ephemeral=True)
@@ -3287,8 +3300,13 @@ async def slash_pendu_lettre(interaction: discord.Interaction, lettre: str):
 
 @tree.command(name="pendu_stop", description="🪢 Arrête la partie de Pendu en cours")
 async def slash_pendu_stop(interaction: discord.Interaction):
-    if interaction.channel_id in pendu_parties:
-        mot = pendu_parties.pop(interaction.channel_id)["mot"]
+    ch_id = interaction.channel_id
+    if ch_id in pendu_parties:
+        partie = pendu_parties[ch_id]
+        if interaction.user.id != partie["user_id"] and not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("❌ Seul le joueur ayant lancé la partie peut l'arrêter.", ephemeral=True)
+            return
+        mot = pendu_parties.pop(ch_id)["mot"]
         await interaction.response.send_message(f"🛑 Partie arrêtée. Le mot était **{mot}**.")
     else:
         await interaction.response.send_message("❌ Aucune partie en cours.", ephemeral=True)
@@ -3311,10 +3329,20 @@ def morpion_verifier(grille: list) -> int:
             return grille[a]
     return 0
 
+def morpion_embed(partie: dict, description: str = None, color: int = 0x8B0000, title: str = "⭕❌ Morpion") -> discord.Embed:
+    if description is None:
+        symbole = "❌" if partie["tour"] == 1 else "⭕"
+        prochain = partie["joueurs"][partie["tour"] - 1]
+        description = f"{morpion_afficher(partie['grille'])}\n\nTour de <@{prochain}> {symbole}"
+    embed = discord.Embed(title=title, description=description, color=color)
+    embed.add_field(name="Joueurs", value=f"❌ <@{partie['joueurs'][0]}> | ⭕ <@{partie['joueurs'][1]}>", inline=False)
+    return embed
+
 class MorpionView(discord.ui.View):
     def __init__(self, ch_id: int):
         super().__init__(timeout=120)
         self.ch_id = ch_id
+        self.message = None
         partie = morpion_parties[ch_id]
         for i in range(9):
             val = partie["grille"][i]
@@ -3336,6 +3364,9 @@ class MorpionView(discord.ui.View):
             if interaction.user.id != joueurs[tour - 1]:
                 await interaction.response.send_message(f"❌ C'est au tour de {'❌' if tour==1 else '⭕'} !", ephemeral=True)
                 return
+            if partie["grille"][idx] != 0:
+                await interaction.response.send_message("❌ Cette case est déjà prise.", ephemeral=True)
+                return
             partie["grille"][idx] = tour
             gagnant = morpion_verifier(partie["grille"])
             nul     = all(c != 0 for c in partie["grille"])
@@ -3349,19 +3380,32 @@ class MorpionView(discord.ui.View):
                 else:
                     desc = f"{morpion_afficher(partie['grille'])}\n\n🤝 **Match nul !**"
                     color = 0xFFA500
-                embed = discord.Embed(title="⭕❌ Morpion", description=desc, color=color)
+                embed = morpion_embed(partie, description=desc, color=color)
                 await interaction.response.edit_message(embed=embed, view=self)
             else:
                 partie["tour"] = 2 if tour == 1 else 1
                 new_view = MorpionView(ch_id)
-                prochain = joueurs[partie["tour"] - 1]
-                embed = discord.Embed(
-                    title="⭕❌ Morpion",
-                    description=f"{morpion_afficher(partie['grille'])}\n\nTour de <@{prochain}> {'❌' if partie['tour']==1 else '⭕'}",
-                    color=0x8B0000
-                )
+                new_view.message = interaction.message
+                embed = morpion_embed(partie)
                 await interaction.response.edit_message(embed=embed, view=new_view)
         return callback
+
+    async def on_timeout(self):
+        partie = morpion_parties.pop(self.ch_id, None)
+        if not partie or not self.message:
+            return
+        for item in self.children:
+            item.disabled = True
+        embed = morpion_embed(
+            partie,
+            description=f"{morpion_afficher(partie['grille'])}\n\n⌛ La partie a expiré faute d'activité.",
+            color=0x95A5A6,
+            title="⭕❌ Morpion — Expiré"
+        )
+        try:
+            await self.message.edit(embed=embed, view=self)
+        except discord.HTTPException:
+            pass
 
 @tree.command(name="morpion", description="⭕❌ Lance une partie de Morpion contre un ami")
 @app_commands.describe(adversaire="Ton adversaire")
@@ -3370,16 +3414,30 @@ async def slash_morpion(interaction: discord.Interaction, adversaire: discord.Me
         await interaction.response.send_message("❌ Choisis un vrai adversaire !", ephemeral=True)
         return
     ch_id = interaction.channel_id
+    if ch_id in morpion_parties:
+        await interaction.response.send_message("❌ Une partie de Morpion est déjà en cours dans ce salon.", ephemeral=True)
+        return
     morpion_parties[ch_id] = {
         "grille": [0]*9, "tour": 1,
         "joueurs": [interaction.user.id, adversaire.id]
     }
-    embed = discord.Embed(
-        title="⭕❌ Morpion",
-        description=f"{morpion_afficher([0]*9)}\n\nTour de {interaction.user.mention} ❌",
-        color=0x8B0000
-    )
-    await interaction.response.send_message(embed=embed, view=MorpionView(ch_id))
+    embed = morpion_embed(morpion_parties[ch_id])
+    view = MorpionView(ch_id)
+    await interaction.response.send_message(embed=embed, view=view)
+    view.message = await interaction.original_response()
+
+@tree.command(name="morpion_stop", description="⭕❌ Arrête la partie de Morpion en cours")
+async def slash_morpion_stop(interaction: discord.Interaction):
+    ch_id = interaction.channel_id
+    partie = morpion_parties.get(ch_id)
+    if not partie:
+        await interaction.response.send_message("❌ Aucune partie de Morpion en cours.", ephemeral=True)
+        return
+    if interaction.user.id not in partie["joueurs"] and not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("❌ Seuls les joueurs peuvent arrêter cette partie.", ephemeral=True)
+        return
+    morpion_parties.pop(ch_id, None)
+    await interaction.response.send_message("🛑 Partie de Morpion arrêtée.")
 
 
 # ── BLACKJACK ────────────────────────────────────────────────────
@@ -3409,11 +3467,23 @@ def bj_afficher(main: list, cacher: bool = False) -> str:
 
 bj_parties: dict[int, dict] = {}
 
+def bj_build_embed(p: dict, title: str = "🃏 Blackjack", message: str = "Tire une carte ou reste ?", reveal_croupier: bool = False, color: int = 0x8B0000) -> discord.Embed:
+    return discord.Embed(
+        title=title,
+        description=(
+            f"Joueur : {bj_afficher(p['joueur'])}\n"
+            f"Croupier : {bj_afficher(p['croupier'], cacher=not reveal_croupier)}\n\n"
+            f"{message}"
+        ),
+        color=color
+    )
+
 class BlackjackView(discord.ui.View):
     def __init__(self, user_id: int, ch_id: int):
         super().__init__(timeout=60)
         self.user_id = user_id
         self.ch_id   = ch_id
+        self.message = None
 
     @discord.ui.button(label="🃏 Tirer", style=discord.ButtonStyle.primary)
     async def tirer(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -3427,14 +3497,16 @@ class BlackjackView(discord.ui.View):
         if score > 21:
             del bj_parties[self.ch_id]
             for item in self.children: item.disabled = True
-            embed = discord.Embed(title="🃏 Blackjack — Perdu !",
-                description=f"Joueur : {bj_afficher(p['joueur'])}\nCroupier : {bj_afficher(p['croupier'])}\n\n💥 **Bust ! Tu dépasses 21.**",
-                color=0xED4245)
+            embed = bj_build_embed(
+                p,
+                title="🃏 Blackjack — Perdu !",
+                message="💥 **Bust ! Tu dépasses 21.**",
+                reveal_croupier=True,
+                color=0xED4245
+            )
             await interaction.response.edit_message(embed=embed, view=self)
         else:
-            embed = discord.Embed(title="🃏 Blackjack",
-                description=f"Joueur : {bj_afficher(p['joueur'])}\nCroupier : {bj_afficher(p['croupier'], cacher=True)}",
-                color=0x8B0000)
+            embed = bj_build_embed(p)
             await interaction.response.edit_message(embed=embed, view=self)
 
     @discord.ui.button(label="🛑 Rester", style=discord.ButtonStyle.success)
@@ -3455,21 +3527,66 @@ class BlackjackView(discord.ui.View):
             titre, msg, color = "🃏 Blackjack — Égalité !", "🤝 **Égalité !**", 0xFFA500
         else:
             titre, msg, color = "🃏 Blackjack — Perdu !", "💀 **Le croupier gagne.**", 0xED4245
-        embed = discord.Embed(title=titre,
-            description=f"Joueur : {bj_afficher(p['joueur'])}\nCroupier : {bj_afficher(p['croupier'])}\n\n{msg}",
-            color=color)
+        embed = bj_build_embed(p, title=titre, message=msg, reveal_croupier=True, color=color)
         await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_timeout(self):
+        p = bj_parties.pop(self.ch_id, None)
+        if not p or not self.message:
+            return
+        for item in self.children:
+            item.disabled = True
+        embed = bj_build_embed(
+            p,
+            title="🃏 Blackjack — Expiré",
+            message="⌛ La partie a expiré faute d'action.",
+            reveal_croupier=True,
+            color=0x95A5A6
+        )
+        try:
+            await self.message.edit(embed=embed, view=self)
+        except discord.HTTPException:
+            pass
 
 @tree.command(name="blackjack", description="🃏 Lance une partie de Blackjack contre le croupier")
 async def slash_blackjack(interaction: discord.Interaction):
+    ch_id = interaction.channel_id
+    if ch_id in bj_parties:
+        await interaction.response.send_message("❌ Une partie de Blackjack est déjà en cours dans ce salon.", ephemeral=True)
+        return
     deck = bj_deck()
     joueur   = [deck.pop(), deck.pop()]
     croupier = [deck.pop(), deck.pop()]
-    bj_parties[interaction.channel_id] = {"joueur": joueur, "croupier": croupier, "deck": deck}
-    embed = discord.Embed(title="🃏 Blackjack",
-        description=f"Joueur : {bj_afficher(joueur)}\nCroupier : {bj_afficher(croupier, cacher=True)}\n\nTire une carte ou reste ?",
-        color=0x8B0000)
-    await interaction.response.send_message(embed=embed, view=BlackjackView(interaction.user.id, interaction.channel_id))
+    bj_parties[ch_id] = {"joueur": joueur, "croupier": croupier, "deck": deck, "owner_id": interaction.user.id}
+    p = bj_parties[ch_id]
+    js = bj_score(joueur)
+    cs = bj_score(croupier)
+    if js == 21 or cs == 21:
+        if js == 21 and cs == 21:
+            titre, msg, color = "🃏 Blackjack — Égalité !", "🤝 Double blackjack.", 0xFFA500
+        elif js == 21:
+            titre, msg, color = "🃏 Blackjack — Blackjack !", "🏆 Blackjack naturel, tu gagnes immédiatement !", 0x57F287
+        else:
+            titre, msg, color = "🃏 Blackjack — Perdu !", "💀 Le croupier a un blackjack naturel.", 0xED4245
+        bj_parties.pop(ch_id, None)
+        await interaction.response.send_message(embed=bj_build_embed(p, title=titre, message=msg, reveal_croupier=True, color=color))
+        return
+    view = BlackjackView(interaction.user.id, ch_id)
+    await interaction.response.send_message(embed=bj_build_embed(p), view=view)
+    view.message = await interaction.original_response()
+
+@tree.command(name="blackjack_stop", description="🃏 Arrête la partie de Blackjack en cours")
+async def slash_blackjack_stop(interaction: discord.Interaction):
+    ch_id = interaction.channel_id
+    partie = bj_parties.get(ch_id)
+    if not partie:
+        await interaction.response.send_message("❌ Aucune partie de Blackjack en cours.", ephemeral=True)
+        return
+    if interaction.user.id != partie["owner_id"] and not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("❌ Seul le joueur ayant lancé la partie peut l'arrêter.", ephemeral=True)
+        return
+    bj_parties.pop(ch_id, None)
+    await interaction.response.send_message("🛑 Partie de Blackjack arrêtée.")
 
 
 # ── UNO ─────────────────────────────────────────────────────────
@@ -3496,82 +3613,306 @@ def uno_compatible(carte: str, dessus: str) -> bool:
 
 uno_parties: dict[int, dict] = {}
 
+def uno_format_main(main: list[str]) -> str:
+    if not main:
+        return "Aucune carte."
+    return "\n".join(f"`{i+1}.` {carte}" for i, carte in enumerate(main))
+
+def uno_build_embed(partie: dict, note: str = None, title: str = "🎴 UNO — La Taverne", color: int = 0xED4245) -> discord.Embed:
+    tour_id = partie["joueurs"][partie["tour"]]
+    sens = "↻" if partie["sens"] == 1 else "↺"
+    compteurs = "\n".join(
+        f"{'👉 ' if idx == partie['tour'] else ''}<@{uid}> : **{len(partie['mains'][uid])}** carte(s)"
+        for idx, uid in enumerate(partie["joueurs"])
+    )
+    description = (
+        f"**Carte du dessus :** {partie['dessus']}\n"
+        f"**Tour de :** <@{tour_id}>\n"
+        f"**Sens :** {sens}\n"
+        f"**Pioche restante :** {len(partie['deck'])} carte(s)\n\n"
+        f"**Mains :**\n{compteurs}"
+    )
+    if note:
+        description += f"\n\n{note}"
+    embed = discord.Embed(title=title, description=description, color=color)
+    embed.set_footer(text="Utilise les boutons pour voir ta main, jouer une carte ou piocher.")
+    return embed
+
+def uno_main_embed(partie: dict, user_id: int) -> discord.Embed:
+    main = partie["mains"][user_id]
+    jouables = [str(i + 1) for i, carte in enumerate(main) if uno_compatible(carte, partie["dessus"])]
+    embed = discord.Embed(
+        title="🎴 Ta main UNO",
+        description=uno_format_main(main),
+        color=0xF1C40F
+    )
+    embed.add_field(name="Carte du dessus", value=partie["dessus"], inline=True)
+    embed.add_field(name="Cartes jouables", value=", ".join(jouables) if jouables else "Aucune", inline=True)
+    return embed
+
+def uno_choose_color(main: list[str]) -> str:
+    counts = {color: 0 for color in UNO_COULEURS}
+    for carte in main:
+        couleur = uno_couleur(carte)
+        if couleur in counts:
+            counts[couleur] += 1
+    max_count = max(counts.values()) if counts else 0
+    meilleures = [color for color, count in counts.items() if count == max_count]
+    return random.choice(meilleures) if meilleures else random.choice(UNO_COULEURS)
+
+def uno_draw_cards(partie: dict, user_id: int, count: int) -> int:
+    piochees = 0
+    while partie["deck"] and piochees < count:
+        partie["mains"][user_id].append(partie["deck"].pop())
+        piochees += 1
+    return piochees
+
+def uno_advance_turn(partie: dict, steps: int = 1) -> None:
+    nb = len(partie["joueurs"])
+    partie["tour"] = (partie["tour"] + (partie["sens"] * steps)) % nb
+
+async def uno_refresh_message(ch_id: int, note: str = None, final_embed: discord.Embed = None) -> None:
+    partie = uno_parties.get(ch_id)
+    if not partie:
+        return
+    channel = bot.get_channel(ch_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(ch_id)
+        except discord.HTTPException:
+            return
+    message_id = partie.get("message_id")
+    if not message_id:
+        return
+    try:
+        message = await channel.fetch_message(message_id)
+    except discord.HTTPException:
+        return
+    if final_embed:
+        await message.edit(embed=final_embed, view=None)
+        return
+    view = UnoView(ch_id)
+    view.message = message
+    await message.edit(embed=uno_build_embed(partie, note=note), view=view)
+
+def uno_play_card(partie: dict, user_id: int, card_index: int) -> tuple[str, bool, str]:
+    main = partie["mains"][user_id]
+    card = main.pop(card_index)
+    valeur = uno_valeur(card)
+    if uno_couleur(card) == "🌈":
+        couleur = uno_choose_color(main)
+        partie["dessus"] = f"{couleur} {valeur}"
+        note = f"<@{user_id}> joue **{card}**.\n🎨 La couleur choisie devient {couleur}."
+    else:
+        partie["dessus"] = card
+        note = f"<@{user_id}> joue **{card}**."
+    if not main:
+        return note + "\n🏆 Plus aucune carte en main.", True, card
+    if len(main) == 1:
+        note += "\n⚠️ UNO ! Plus qu'une carte."
+
+    if valeur == "Reverse":
+        if len(partie["joueurs"]) == 2:
+            uno_advance_turn(partie, 2)
+            note += "\n🔄 Reverse en duel: le tour adverse est sauté."
+        else:
+            partie["sens"] *= -1
+            uno_advance_turn(partie, 1)
+            note += "\n🔄 Le sens du tour change."
+    elif valeur == "Skip":
+        uno_advance_turn(partie, 2)
+        note += "\n⏭️ Le prochain joueur passe son tour."
+    elif valeur == "+2":
+        cible_idx = (partie["tour"] + partie["sens"]) % len(partie["joueurs"])
+        cible_id = partie["joueurs"][cible_idx]
+        nb = uno_draw_cards(partie, cible_id, 2)
+        uno_advance_turn(partie, 2)
+        note += f"\n📥 <@{cible_id}> pioche {nb} carte(s) et passe son tour."
+    elif valeur == "+4":
+        cible_idx = (partie["tour"] + partie["sens"]) % len(partie["joueurs"])
+        cible_id = partie["joueurs"][cible_idx]
+        nb = uno_draw_cards(partie, cible_id, 4)
+        uno_advance_turn(partie, 2)
+        note += f"\n📥 <@{cible_id}> pioche {nb} carte(s) et passe son tour."
+    else:
+        uno_advance_turn(partie, 1)
+    return note, False, card
+
+class UnoPlaySelect(discord.ui.Select):
+    def __init__(self, ch_id: int, user_id: int):
+        partie = uno_parties[ch_id]
+        options = []
+        for index, carte in enumerate(partie["mains"][user_id]):
+            if uno_compatible(carte, partie["dessus"]):
+                options.append(
+                    discord.SelectOption(
+                        label=f"{index + 1}. {carte}"[:100],
+                        value=str(index),
+                        description="Carte jouable"
+                    )
+                )
+        super().__init__(
+            placeholder="Choisis une carte jouable",
+            min_values=1,
+            max_values=1,
+            options=options[:25]
+        )
+        self.ch_id = ch_id
+        self.user_id = user_id
+
+    async def callback(self, interaction: discord.Interaction):
+        partie = uno_parties.get(self.ch_id)
+        if not partie:
+            await interaction.response.edit_message(content="❌ La partie est terminée.", embed=None, view=None)
+            return
+        if interaction.user.id != self.user_id or interaction.user.id != partie["joueurs"][partie["tour"]]:
+            await interaction.response.send_message("❌ Ce n'est plus ton tour.", ephemeral=True)
+            return
+        main = partie["mains"][self.user_id]
+        card_index = int(self.values[0])
+        if card_index >= len(main):
+            await interaction.response.send_message("❌ Cette carte n'est plus disponible.", ephemeral=True)
+            return
+        carte = main[card_index]
+        if not uno_compatible(carte, partie["dessus"]):
+            await interaction.response.send_message("❌ Cette carte n'est plus jouable.", ephemeral=True)
+            return
+        note, fini, played_card = uno_play_card(partie, self.user_id, card_index)
+        await interaction.response.edit_message(content=f"✅ Tu as joué **{played_card}**.", embed=None, view=None)
+        if fini:
+            final_embed = discord.Embed(
+                title="🎴 UNO — Victoire !",
+                description=f"🏆 {interaction.user.mention} remporte la partie.\n\n{note}",
+                color=0x57F287
+            )
+            await uno_refresh_message(self.ch_id, final_embed=final_embed)
+            uno_parties.pop(self.ch_id, None)
+            return
+        await uno_refresh_message(self.ch_id, note=note)
+
+class UnoPlayView(discord.ui.View):
+    def __init__(self, ch_id: int, user_id: int):
+        super().__init__(timeout=60)
+        self.add_item(UnoPlaySelect(ch_id, user_id))
+
 class UnoView(discord.ui.View):
     def __init__(self, ch_id: int):
         super().__init__(timeout=180)
         self.ch_id = ch_id
+        self.message = None
 
-    def _embed(self, p: dict) -> discord.Embed:
-        tour_id = p["joueurs"][p["tour"]]
-        main    = p["mains"][tour_id]
-        return discord.Embed(
-            title="🎴 UNO — La Taverne",
-            description=(
-                f"**Carte du dessus :** {p['dessus']}\n"
-                f"**Tour de :** <@{tour_id}>\n"
-                f"**Ta main ({len(main)} cartes) :**\n"
-                + "\n".join(f"`{i+1}.` {c}" for i,c in enumerate(main[:10]))
-                + ("\n*...et plus*" if len(main) > 10 else "")
-            ),
-            color=0xED4245
-        )
+    @discord.ui.button(label="👀 Voir ma main", style=discord.ButtonStyle.secondary)
+    async def voir_main(self, interaction: discord.Interaction, button: discord.ui.Button):
+        partie = uno_parties.get(self.ch_id)
+        if not partie or interaction.user.id not in partie["joueurs"]:
+            await interaction.response.send_message("❌ Tu ne participes pas à cette partie.", ephemeral=True)
+            return
+        await interaction.response.send_message(embed=uno_main_embed(partie, interaction.user.id), ephemeral=True)
 
     @discord.ui.button(label="🃏 Jouer une carte", style=discord.ButtonStyle.primary)
     async def jouer(self, interaction: discord.Interaction, button: discord.ui.Button):
-        p = uno_parties.get(self.ch_id)
-        if not p or interaction.user.id != p["joueurs"][p["tour"]]:
-            await interaction.response.send_message("❌ Ce n'est pas ton tour !", ephemeral=True); return
-        main = p["mains"][interaction.user.id]
-        jouables = [c for c in main if uno_compatible(c, p["dessus"])]
-        if not jouables:
-            await interaction.response.send_message("❌ Aucune carte jouable ! Pioche avec le bouton.", ephemeral=True); return
-        # Afficher les cartes jouables
-        desc = "\n".join(f"`{i+1}.` {c}" for i,c in enumerate(jouables))
+        partie = uno_parties.get(self.ch_id)
+        if not partie or interaction.user.id != partie["joueurs"][partie["tour"]]:
+            await interaction.response.send_message("❌ Ce n'est pas ton tour.", ephemeral=True)
+            return
+        main = partie["mains"][interaction.user.id]
+        if not any(uno_compatible(carte, partie["dessus"]) for carte in main):
+            await interaction.response.send_message("❌ Aucune carte jouable. Pioche avec le bouton prévu.", ephemeral=True)
+            return
         await interaction.response.send_message(
-            f"**Tes cartes jouables :**\n{desc}\n\nRéponds avec le numéro (ex: `1`)",
+            embed=uno_main_embed(partie, interaction.user.id),
+            view=UnoPlayView(self.ch_id, interaction.user.id),
             ephemeral=True
         )
 
     @discord.ui.button(label="📥 Piocher", style=discord.ButtonStyle.secondary)
     async def piocher(self, interaction: discord.Interaction, button: discord.ui.Button):
-        p = uno_parties.get(self.ch_id)
-        if not p or interaction.user.id != p["joueurs"][p["tour"]]:
-            await interaction.response.send_message("❌ Ce n'est pas ton tour !", ephemeral=True); return
-        if not p["deck"]:
-            await interaction.response.send_message("❌ La pioche est vide !", ephemeral=True); return
-        carte = p["deck"].pop()
-        p["mains"][interaction.user.id].append(carte)
-        nb = len(p["joueurs"])
-        p["tour"] = (p["tour"] + 1) % nb
-        await interaction.response.edit_message(embed=self._embed(p), view=self)
+        partie = uno_parties.get(self.ch_id)
+        if not partie or interaction.user.id != partie["joueurs"][partie["tour"]]:
+            await interaction.response.send_message("❌ Ce n'est pas ton tour.", ephemeral=True)
+            return
+        if not partie["deck"]:
+            await interaction.response.send_message("❌ La pioche est vide.", ephemeral=True)
+            return
+        carte = partie["deck"].pop()
+        partie["mains"][interaction.user.id].append(carte)
+        uno_advance_turn(partie, 1)
+        new_view = UnoView(self.ch_id)
+        new_view.message = interaction.message
+        note = f"{interaction.user.mention} pioche 1 carte et passe son tour."
+        await interaction.response.edit_message(embed=uno_build_embed(partie, note=note), view=new_view)
+        await interaction.followup.send(f"📥 Tu as pioché **{carte}**.", ephemeral=True)
+
+    async def on_timeout(self):
+        partie = uno_parties.pop(self.ch_id, None)
+        if not partie or not self.message:
+            return
+        try:
+            await self.message.edit(
+                embed=uno_build_embed(
+                    partie,
+                    note="⌛ La partie a expiré faute d'activité.",
+                    title="🎴 UNO — Expiré",
+                    color=0x95A5A6
+                ),
+                view=None
+            )
+        except discord.HTTPException:
+            pass
 
 @tree.command(name="uno", description="🎴 Lance une partie de UNO (2-4 joueurs)")
 @app_commands.describe(j2="Joueur 2", j3="Joueur 3 (optionnel)", j4="Joueur 4 (optionnel)")
 async def slash_uno(interaction: discord.Interaction, j2: discord.Member, j3: discord.Member = None, j4: discord.Member = None):
-    joueurs = [interaction.user.id, j2.id]
-    if j3 and j3.id not in joueurs: joueurs.append(j3.id)
-    if j4 and j4.id not in joueurs: joueurs.append(j4.id)
+    ch_id = interaction.channel_id
+    if ch_id in uno_parties:
+        await interaction.response.send_message("❌ Une partie de UNO est déjà en cours dans ce salon.", ephemeral=True)
+        return
+    joueurs_membres = [interaction.user, j2]
+    for joueur in (j3, j4):
+        if joueur and joueur.id not in [m.id for m in joueurs_membres]:
+            joueurs_membres.append(joueur)
+    if any(joueur.bot for joueur in joueurs_membres):
+        await interaction.response.send_message("❌ Les bots ne peuvent pas participer au UNO.", ephemeral=True)
+        return
+    joueurs = [m.id for m in joueurs_membres]
     deck  = uno_deck()
     mains = {uid: [deck.pop() for _ in range(7)] for uid in joueurs}
     dessus = deck.pop()
     while uno_couleur(dessus) == "🌈":
         deck.insert(0, dessus); dessus = deck.pop()
-    ch_id = interaction.channel_id
-    uno_parties[ch_id] = {"joueurs": joueurs, "mains": mains, "deck": deck, "dessus": dessus, "tour": 0}
-    p     = uno_parties[ch_id]
+    uno_parties[ch_id] = {
+        "joueurs": joueurs,
+        "mains": mains,
+        "deck": deck,
+        "dessus": dessus,
+        "tour": 0,
+        "sens": 1,
+        "owner_id": interaction.user.id,
+        "message_id": None,
+    }
+    p = uno_parties[ch_id]
     view  = UnoView(ch_id)
-    embed = discord.Embed(
-        title="🎴 UNO — La Taverne",
-        description=(
-            f"**Joueurs :** {', '.join(f'<@{u}>' for u in joueurs)}\n"
-            f"**Carte du dessus :** {dessus}\n"
-            f"**Tour de :** <@{joueurs[0]}>\n\n"
-            "Clique **Jouer une carte** ou **Piocher** !\n"
-            "*(Pour jouer une carte, clique le bouton et entre le numéro en message privé)*"
-        ),
-        color=0xED4245
+    embed = uno_build_embed(
+        p,
+        note=f"**Joueurs :** {', '.join(m.mention for m in joueurs_membres)}\nLe premier joueur peut commencer."
     )
     await interaction.response.send_message(embed=embed, view=view)
+    message = await interaction.original_response()
+    p["message_id"] = message.id
+    view.message = message
+
+@tree.command(name="uno_stop", description="🎴 Arrête la partie de UNO en cours")
+async def slash_uno_stop(interaction: discord.Interaction):
+    ch_id = interaction.channel_id
+    partie = uno_parties.get(ch_id)
+    if not partie:
+        await interaction.response.send_message("❌ Aucune partie de UNO en cours.", ephemeral=True)
+        return
+    if interaction.user.id not in partie["joueurs"] and not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("❌ Seuls les participants peuvent arrêter cette partie.", ephemeral=True)
+        return
+    uno_parties.pop(ch_id, None)
+    await interaction.response.send_message("🛑 Partie de UNO arrêtée.")
 
 # ════════════════════════════════════════════════════════════════
 #  📊  [17] COMPTEURS DE MEMBRES
