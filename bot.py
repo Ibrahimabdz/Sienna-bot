@@ -37,6 +37,7 @@ load_dotenv()
 # Sur Railway le volume est monté sur /app/data, sinon on utilise le dossier local
 _DATA_DIR = "/app/data" if os.path.isdir("/app/data") else os.path.dirname(os.path.abspath(__file__))
 DATA_FILE  = os.path.join(_DATA_DIR, "data.json")
+_data_dirty = False
 
 # ── Variables de config (écrasées par load_data au démarrage) ──
 CONFESSION_CHANNEL_ID: int  = 0
@@ -50,11 +51,15 @@ REGLEMENT_CHANNEL_ID: int = 0      # ID du salon règlement
 
 def save_data():
     """Sauvegarde xp_data, warns, reaction_roles et la config des salons dans data.json"""
+    global _data_dirty
     try:
         payload = {
             "xp_data":        {str(k): v for k, v in xp_data.items()},
             "warns":          {str(k): v for k, v in warns.items()},
             "reaction_roles": {str(k): v for k, v in reaction_roles.items()},
+            "open_tickets":   {str(k): v for k, v in open_tickets.items()},
+            "announced_games": list(announced_games),
+            "comics_last_posted": comics_last_posted,
             "config": {
                 "CONFESSION_CHANNEL_ID": CONFESSION_CHANNEL_ID,
                 "BOOST_CHANNEL_ID":       BOOST_CHANNEL_ID,
@@ -75,12 +80,19 @@ def save_data():
         }
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+        _data_dirty = False
     except Exception as e:
         print(f"⚠️ Erreur sauvegarde : {e}")
+
+def mark_data_dirty():
+    global _data_dirty
+    _data_dirty = True
 
 def load_data():
     """Charge toutes les données depuis data.json au démarrage"""
     global xp_data, warns, reaction_roles
+    global open_tickets, announced_games, comics_last_posted
+    global _data_dirty
     global CONFESSION_CHANNEL_ID, confession_counter
     global WELCOME_CHANNEL_ID, GOODBYE_CHANNEL_ID, LOG_CHANNEL_ID
     global FREE_GAMES_CHANNEL_ID, LEVELUP_CHANNEL_ID, TICKET_CATEGORY_ID
@@ -97,6 +109,9 @@ def load_data():
         xp_data        = {int(k): v for k, v in payload.get("xp_data", {}).items()}
         warns          = {int(k): v for k, v in payload.get("warns",   {}).items()}
         reaction_roles = {int(k): v for k, v in payload.get("reaction_roles", {}).items()}
+        open_tickets   = {int(k): v for k, v in payload.get("open_tickets", {}).items()}
+        announced_games = set(payload.get("announced_games", []))
+        comics_last_posted = payload.get("comics_last_posted", {})
         cfg = payload.get("config", {})
         CONFESSION_CHANNEL_ID = cfg.get("CONFESSION_CHANNEL_ID", CONFESSION_CHANNEL_ID)
         confession_counter    = cfg.get("confession_counter",    confession_counter)
@@ -113,6 +128,7 @@ def load_data():
         REGLEMENT_CHANNEL_ID  = cfg.get("REGLEMENT_CHANNEL_ID",  REGLEMENT_CHANNEL_ID)
         MARVEL_CHANNEL_ID     = cfg.get("MARVEL_CHANNEL_ID",     MARVEL_CHANNEL_ID)
         DC_CHANNEL_ID         = cfg.get("DC_CHANNEL_ID",         DC_CHANNEL_ID)
+        _data_dirty = False
         print(f"✅ Données chargées : {len(xp_data)} joueurs, {len(warns)} avertissements")
     except Exception as e:
         print(f"⚠️ Erreur chargement data.json : {e}")
@@ -304,7 +320,8 @@ def check_game_cooldown(user_id: int, game: str, seconds: int) -> float:
 @tasks.loop(minutes=5)
 async def save_loop():
     """Sauvegarde automatique toutes les 5 minutes"""
-    save_data()
+    if _data_dirty:
+        save_data()
 
 
 @bot.event
@@ -428,6 +445,7 @@ async def on_member_join(member: discord.Member):
         log.add_field(name="✉️ Invité par", value="Inconnu (lien vanity ou DM ?)", inline=False)
     log.set_footer(text=f"ID : {member.id}")
     await send_log(guild, log)
+    await update_counters(guild)
 
     # Auto-rôles
     for role_id in AUTO_ROLES:
@@ -703,6 +721,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         voice_join_time[uid] = now
         d = get_user_data(uid)
         d["top_voice"][after.channel.name] = d["top_voice"].get(after.channel.name, 0) + 1
+        mark_data_dirty()
     elif before.channel and not after.channel:
         # Quitté
         if uid in voice_join_time:
@@ -711,6 +730,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             d["voice_history"].append((start, now))
             cutoff = now - 14 * 86400
             d["voice_history"] = [(s, e) for s, e in d["voice_history"] if e >= cutoff]
+            mark_data_dirty()
     elif before.channel and after.channel:
         # Changement de salon
         if uid in voice_join_time:
@@ -722,6 +742,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         voice_join_time[uid] = now
         d = get_user_data(uid)
         d["top_voice"][after.channel.name] = d["top_voice"].get(after.channel.name, 0) + 1
+        mark_data_dirty()
 
     embed = discord.Embed(color=0x1ABC9C, timestamp=datetime.utcnow())
     embed.set_author(name=str(member), icon_url=member.display_avatar.url)
@@ -832,7 +853,6 @@ async def on_message(message: discord.Message):
     uid = message.author.id
     if now - xp_cooldowns.get(uid, 0) >= XP_COOLDOWN:
         xp_cooldowns[uid] = now
-        save_data()
         data   = get_user_data(uid)
         data["xp"] += XP_PER_MESSAGE
         # Historique messages (garde 14 jours)
@@ -848,6 +868,7 @@ async def on_message(message: discord.Message):
             data["xp"]    -= needed
             data["level"] += 1
             leveled        = True
+        mark_data_dirty()
         lvl = data["level"]
         if not leveled:
             await bot.process_commands(message)
@@ -967,6 +988,7 @@ class TicketView(discord.ui.View):
         uid = next((u for u, c in open_tickets.items() if c == channel.id), None)
         if uid:
             del open_tickets[uid]
+            save_data()
         ticket_claimed.pop(channel.id, None)
 
         embed = discord.Embed(
@@ -1021,6 +1043,7 @@ async def _create_ticket(interaction: discord.Interaction, ticket_type: str):
         name=ch_name, category=category, overwrites=overwrites, reason=f"Ticket {ticket_type} de {user}"
     )
     open_tickets[user.id] = ticket_ch.id
+    save_data()
 
     # ── Exemption AutoMod : autoriser les liens dans ce salon ticket ──
     try:
@@ -1189,10 +1212,10 @@ async def slash_guess(interaction: discord.Interaction):
     await interaction.response.defer()
     left = check_game_cooldown(interaction.user.id, "guess", 30)
     if left > 0:
-        await interaction.response.send_message(f"⏳ Cooldown ! Réessaie dans **{left:.0f}s**.", ephemeral=True)
+        await interaction.followup.send(f"⏳ Cooldown ! Réessaie dans **{left:.0f}s**.", ephemeral=True)
         return
     secret = random.randint(1, 100)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"🔢 J'ai choisi un nombre entre **1 et 100**. Tu as **5 tentatives** !\n"
         f"Réponds avec `!guess <nombre>`"
     )
@@ -1230,6 +1253,7 @@ async def check_free_games():
         if gid in announced_games:
             continue
         announced_games.add(gid)
+        mark_data_dirty()
         await ch.send(embed=build_game_embed(game))
 
 
@@ -1362,6 +1386,7 @@ async def slash_setgoodbye(interaction: discord.Interaction, channel: discord.Te
 async def slash_setfreegames(interaction: discord.Interaction, channel: discord.TextChannel):
     global FREE_GAMES_CHANNEL_ID
     FREE_GAMES_CHANNEL_ID = channel.id
+    save_data()
     await interaction.response.send_message(f"✅ Salon jeux gratuits : {channel.mention}", ephemeral=True)
 
 @tree.command(name="setlevelup", description="[Admin] Définit le salon des notifications de level-up")
@@ -1399,11 +1424,13 @@ async def slash_autorole(interaction: discord.Interaction, role: discord.Role = 
         if role.id not in AUTO_ROLES:
             AUTO_ROLES.append(role.id)
         AUTO_ROLE_ID = AUTO_ROLES[0] if AUTO_ROLES else 0
+        save_data()
         await interaction.response.send_message(f"✅ {role.mention} ajouté aux auto-rôles !", ephemeral=True)
     elif action == "remove":
         if role.id in AUTO_ROLES:
             AUTO_ROLES.remove(role.id)
         AUTO_ROLE_ID = AUTO_ROLES[0] if AUTO_ROLES else 0
+        save_data()
         await interaction.response.send_message(f"✅ {role.mention} retiré des auto-rôles.", ephemeral=True)
 
 @tree.command(name="setticketcategory", description="[Admin] Définit la catégorie des tickets")
@@ -1411,6 +1438,7 @@ async def slash_autorole(interaction: discord.Interaction, role: discord.Role = 
 async def slash_setticketcategory(interaction: discord.Interaction, categorie: discord.CategoryChannel):
     global TICKET_CATEGORY_ID
     TICKET_CATEGORY_ID = categorie.id
+    save_data()
     await interaction.response.send_message(f"✅ Catégorie tickets : **{categorie.name}**", ephemeral=True)
 
 @tree.command(name="ticketpanel", description="[Admin] Envoie le panel de tickets avec l'image dans ce salon")
@@ -1452,6 +1480,7 @@ async def slash_ticketpanel(interaction: discord.Interaction):
 @app_commands.describe(niveau="Niveau requis", role="Rôle à attribuer")
 async def slash_setlevelrole(interaction: discord.Interaction, niveau: int, role: discord.Role):
     LEVEL_ROLES[niveau] = role.id
+    save_data()
     await interaction.response.send_message(
         f"✅ Niveau **{niveau}** → {role.mention}", ephemeral=True
     )
@@ -1666,13 +1695,29 @@ async def send_dm(member: discord.Member, embed: discord.Embed) -> bool:
     except (discord.Forbidden, discord.HTTPException):
         return False
 
+def get_moderation_block_reason(interaction: discord.Interaction, membre: discord.Member) -> str | None:
+    guild = interaction.guild
+    actor = interaction.user
+    bot_member = guild.me
+
+    if membre.id == actor.id:
+        return "❌ Tu ne peux pas te modérer toi-même."
+    if membre == guild.owner:
+        return "❌ Impossible de modérer le propriétaire du serveur."
+    if actor != guild.owner and membre.top_role >= actor.top_role:
+        return "❌ Tu ne peux pas modérer un membre ayant un rôle égal ou supérieur au tien."
+    if bot_member and membre.top_role >= bot_member.top_role:
+        return "❌ Je ne peux pas modérer ce membre (rôle trop élevé)."
+    return None
+
 
 @tree.command(name="ban", description="[Mod] Bannit un membre")
 @app_commands.describe(membre="Membre à bannir", raison="Raison du ban")
 @app_commands.checks.has_permissions(ban_members=True)
 async def slash_ban(interaction: discord.Interaction, membre: discord.Member, raison: str = "Aucune raison fournie"):
-    if membre.top_role >= interaction.guild.me.top_role:
-        await interaction.response.send_message("❌ Je ne peux pas bannir ce membre (rôle trop élevé).", ephemeral=True)
+    block_reason = get_moderation_block_reason(interaction, membre)
+    if block_reason:
+        await interaction.response.send_message(block_reason, ephemeral=True)
         return
 
     # MP au membre
@@ -1704,8 +1749,9 @@ async def slash_ban(interaction: discord.Interaction, membre: discord.Member, ra
 @app_commands.describe(membre="Membre à expulser", raison="Raison du kick")
 @app_commands.checks.has_permissions(kick_members=True)
 async def slash_kick(interaction: discord.Interaction, membre: discord.Member, raison: str = "Aucune raison fournie"):
-    if membre.top_role >= interaction.guild.me.top_role:
-        await interaction.response.send_message("❌ Je ne peux pas expulser ce membre.", ephemeral=True)
+    block_reason = get_moderation_block_reason(interaction, membre)
+    if block_reason:
+        await interaction.response.send_message(block_reason, ephemeral=True)
         return
 
     dm_embed = discord.Embed(
@@ -1735,8 +1781,9 @@ async def slash_kick(interaction: discord.Interaction, membre: discord.Member, r
 @app_commands.checks.has_permissions(moderate_members=True)
 async def slash_mute(interaction: discord.Interaction, membre: discord.Member, duree: int = 10, raison: str = "Aucune raison fournie"):
     from datetime import timedelta
-    if membre.top_role >= interaction.guild.me.top_role:
-        await interaction.response.send_message("❌ Je ne peux pas muter ce membre.", ephemeral=True)
+    block_reason = get_moderation_block_reason(interaction, membre)
+    if block_reason:
+        await interaction.response.send_message(block_reason, ephemeral=True)
         return
     if duree < 1 or duree > 40320:
         await interaction.response.send_message("❌ Durée entre 1 min et 40320 min (28 jours).", ephemeral=True)
@@ -1769,6 +1816,10 @@ async def slash_mute(interaction: discord.Interaction, membre: discord.Member, d
 @tree.command(name="unmute", description="[Mod] Retire le mute d'un membre")
 @app_commands.checks.has_permissions(moderate_members=True)
 async def slash_unmute(interaction: discord.Interaction, membre: discord.Member):
+    block_reason = get_moderation_block_reason(interaction, membre)
+    if block_reason:
+        await interaction.response.send_message(block_reason, ephemeral=True)
+        return
     await membre.timeout(None)
     embed = discord.Embed(title="🔊 Membre démuté", color=0x57F287, timestamp=datetime.utcnow())
     embed.add_field(name="Membre",     value=f"{membre} (`{membre.id}`)")
@@ -1781,6 +1832,10 @@ async def slash_unmute(interaction: discord.Interaction, membre: discord.Member)
 @app_commands.describe(membre="Membre à avertir", raison="Raison de l'avertissement")
 @app_commands.checks.has_permissions(moderate_members=True)
 async def slash_warn(interaction: discord.Interaction, membre: discord.Member, raison: str):
+    block_reason = get_moderation_block_reason(interaction, membre)
+    if block_reason:
+        await interaction.response.send_message(block_reason, ephemeral=True)
+        return
     uid = membre.id
     if uid not in warns:
         warns[uid] = []
@@ -1790,6 +1845,7 @@ async def slash_warn(interaction: discord.Interaction, membre: discord.Member, r
         "date":   datetime.utcnow().strftime("%d/%m/%Y %H:%M")
     })
     count = len(warns[uid])
+    save_data()
 
     dm_embed = discord.Embed(
         title="⚠️ Tu as reçu un avertissement",
@@ -1824,6 +1880,7 @@ async def slash_warn(interaction: discord.Interaction, membre: discord.Member, r
         try:
             await membre.ban(reason="3 avertissements atteints")
             warns.pop(uid, None)
+            save_data()
             await interaction.channel.send(embed=ban_embed)
             await send_log(interaction.guild, ban_embed)
         except discord.Forbidden:
@@ -1856,7 +1913,12 @@ async def slash_warns(interaction: discord.Interaction, membre: discord.Member =
 @tree.command(name="clearwarns", description="[Mod] Efface les avertissements d'un membre")
 @app_commands.checks.has_permissions(moderate_members=True)
 async def slash_clearwarns(interaction: discord.Interaction, membre: discord.Member):
+    block_reason = get_moderation_block_reason(interaction, membre)
+    if block_reason:
+        await interaction.response.send_message(block_reason, ephemeral=True)
+        return
     warns.pop(membre.id, None)
+    save_data()
     await interaction.response.send_message(
         f"✅ Avertissements de {membre.mention} effacés.", ephemeral=True
     )
@@ -3364,16 +3426,6 @@ async def counter_loop():
         await update_counters(guild)
 
 
-@bot.event
-async def on_member_join_counter(member: discord.Member):
-    await update_counters(member.guild)
-
-
-@bot.event
-async def on_member_remove_counter(member: discord.Member):
-    await update_counters(member.guild)
-
-
 # ── Commandes de configuration des compteurs ─────────────────
 
 @tree.command(name="setcounters", description="[Admin] Configure les salons compteurs de membres")
@@ -3393,6 +3445,7 @@ async def slash_setcounters(
     COUNTER_MEMBERS_ID = membres.id
     COUNTER_BOTS_ID    = bots.id
     COUNTER_CREATED_ID = creation.id
+    save_data()
 
     await update_counters(interaction.guild)
 
@@ -3501,6 +3554,7 @@ async def slash_reactionrole(interaction: discord.Interaction, salon: discord.Te
     embed.set_footer(text="Réagis pour obtenir ton rôle ✨")
     msg = await salon.send(embed=embed)
     reaction_roles[msg.id] = {}
+    save_data()
     await interaction.response.send_message(
         f"✅ Message créé dans {salon.mention} ! (ID: `{msg.id}`)\n"
         f"Utilise `/ajouterreaction` pour lier des emojis à des rôles.", ephemeral=True
@@ -3549,6 +3603,9 @@ async def slash_retirerreaction(interaction: discord.Interaction, message_id: st
         return
     if msg_id in reaction_roles and emoji in reaction_roles[msg_id]:
         del reaction_roles[msg_id][emoji]
+        if not reaction_roles[msg_id]:
+            del reaction_roles[msg_id]
+        save_data()
         await interaction.response.send_message(f"✅ {emoji} retiré.", ephemeral=True)
     else:
         await interaction.response.send_message("❌ Emoji introuvable.", ephemeral=True)
@@ -3962,10 +4019,12 @@ async def slash_tropheepanel(interaction: discord.Interaction):
 
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ Permission insuffisante.", ephemeral=True)
+    message = "❌ Permission insuffisante." if isinstance(error, app_commands.MissingPermissions) else f"❌ Erreur : {error}"
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
     else:
-        await interaction.response.send_message(f"❌ Erreur : {error}", ephemeral=True)
+        await interaction.response.send_message(message, ephemeral=True)
+    if not isinstance(error, app_commands.MissingPermissions):
         raise error
 
 
@@ -4339,6 +4398,7 @@ async def comics_auto_loop():
                     continue  # rien de nouveau
 
                 comics_last_posted[publisher] = top_date
+                mark_data_dirty()
 
                 # Message d'intro
                 intro = discord.Embed(
