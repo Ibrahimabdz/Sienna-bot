@@ -328,6 +328,35 @@ def _message_interaction_user_id(message: discord.Message) -> int:
             return int(user.id)
     return 0
 
+def _extract_user_id_from_bump_message(message: discord.Message) -> int:
+    import re as _re
+
+    user_id = _message_interaction_user_id(message)
+    if user_id:
+        return user_id
+
+    if message.mentions:
+        for member in message.mentions:
+            if not member.bot:
+                return int(member.id)
+
+    chunks = [message.content or ""]
+    for embed in message.embeds:
+        chunks.extend(
+            [
+                embed.title or "",
+                embed.description or "",
+                embed.author.name if embed.author else "",
+                embed.footer.text if embed.footer else "",
+            ]
+        )
+    joined = " ".join(chunks)
+    mention_match = _re.search(r"<@!?(\d{15,22})>", joined)
+    if mention_match:
+        return int(mention_match.group(1))
+
+    return 0
+
 def _message_interaction_name(message: discord.Message) -> str:
     interaction_meta = getattr(message, "interaction_metadata", None)
     if interaction_meta:
@@ -371,6 +400,12 @@ def _is_confirmed_bump_message(message: discord.Message) -> bool:
         "a été envoyé",
         "successfully bumped",
         "succès",
+        "merci d'avoir bump",
+        "thanks for bumping",
+        "bump effectué",
+        "bump effectué avec succès",
+        "le serveur a été bump",
+        "the server has been bumped",
     ]
     cooldown_markers = [
         "can be bumped again",
@@ -379,6 +414,9 @@ def _is_confirmed_bump_message(message: discord.Message) -> bool:
         "wait another",
         "patiente",
         "cooldown",
+        "you can bump again",
+        "vous pourrez bump",
+        "encore attendre",
     ]
     return any(marker in content for marker in success_markers) and not any(marker in content for marker in cooldown_markers)
 
@@ -386,7 +424,7 @@ async def _handle_bump_success(message: discord.Message) -> bool:
     if not _is_confirmed_bump_message(message):
         return False
 
-    user_id = _message_interaction_user_id(message)
+    user_id = _extract_user_id_from_bump_message(message)
     if not user_id:
         return False
 
