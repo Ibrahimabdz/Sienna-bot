@@ -48,9 +48,10 @@ BOOST_CHANNEL_ID:      int  = 0      # salon où envoyer les messages de boost
 reaction_roles: dict = {}          # {msg_id: {emoji: role_id}}
 REGLEMENT_MSG_ID:     int = 0      # ID du message règlement
 REGLEMENT_CHANNEL_ID: int = 0      # ID du salon règlement
+gacha_profiles: dict[int, dict] = {}
 
 def save_data():
-    """Sauvegarde xp_data, warns, reaction_roles et la config des salons dans data.json"""
+    """Sauvegarde les données persistantes du bot dans data.json."""
     global _data_dirty
     try:
         payload = {
@@ -60,6 +61,7 @@ def save_data():
             "open_tickets":   {str(k): v for k, v in open_tickets.items()},
             "announced_games": list(announced_games),
             "comics_last_posted": comics_last_posted,
+            "gacha_profiles": {str(k): v for k, v in gacha_profiles.items()},
             "config": {
                 "CONFESSION_CHANNEL_ID": CONFESSION_CHANNEL_ID,
                 "BOOST_CHANNEL_ID":       BOOST_CHANNEL_ID,
@@ -92,6 +94,7 @@ def load_data():
     """Charge toutes les données depuis data.json au démarrage"""
     global xp_data, warns, reaction_roles
     global open_tickets, announced_games, comics_last_posted
+    global gacha_profiles
     global _data_dirty
     global CONFESSION_CHANNEL_ID, confession_counter
     global WELCOME_CHANNEL_ID, GOODBYE_CHANNEL_ID, LOG_CHANNEL_ID
@@ -112,6 +115,7 @@ def load_data():
         open_tickets   = {int(k): v for k, v in payload.get("open_tickets", {}).items()}
         announced_games = set(payload.get("announced_games", []))
         comics_last_posted = payload.get("comics_last_posted", {})
+        gacha_profiles = {int(k): v for k, v in payload.get("gacha_profiles", {}).items()}
         cfg = payload.get("config", {})
         CONFESSION_CHANNEL_ID = cfg.get("CONFESSION_CHANNEL_ID", CONFESSION_CHANNEL_ID)
         confession_counter    = cfg.get("confession_counter",    confession_counter)
@@ -199,6 +203,10 @@ announced_games: set = set()
 
 # ── Système de modération
 warns: dict[int, list] = {}  # {user_id: [{raison, mod, date}]}
+
+# ── Gacha comics / personnages
+GACHA_COOLDOWN = 3 * 3600
+GACHA_PITY_THRESHOLD = 20
 
 # ════════════════════════════════════════════════════════════════
 #  🤖  [2] INTENTS & BOT
@@ -4046,227 +4054,302 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 COMICVINE_API_KEY = os.getenv("COMICVINE_API_KEY", "")
 COMICVINE_BASE    = "https://comicvine.gamespot.com/api"
 COMICVINE_HEADERS = {"User-Agent": "SiennaBot/1.0 Discord Bot"}
+CV_PUBLISHERS = {
+    31: {"name": "Marvel", "emoji": "🔴", "color": 0xEC1D24, "slug": "marvel"},
+    10: {"name": "DC Comics", "emoji": "🔵", "color": 0x0075C8, "slug": "dc"},
+}
+cv_issue_detail_cache: dict[int, dict] = {}
+cv_volume_publisher_cache: dict[int, dict] = {}
+cv_character_pool_cache: dict[int, dict] = {}
+
+def _publisher_meta(publisher_id: int) -> dict:
+    return CV_PUBLISHERS.get(publisher_id, {"name": "Comics", "emoji": "📚", "color": 0x8B0000, "slug": "all"})
+
+def _cv_resource_url(resource: str, resource_id: int) -> str:
+    prefixes = {"issue": "4000", "volume": "4050"}
+    prefix = prefixes.get(resource, "")
+    return f"{COMICVINE_BASE}/{resource}/{prefix}-{resource_id}/" if prefix else f"{COMICVINE_BASE}/{resource}/{resource_id}/"
+
+def _cv_extract_image(image_obj: dict | None) -> str:
+    image_obj = image_obj or {}
+    return (
+        image_obj.get("original_url")
+        or image_obj.get("super_url")
+        or image_obj.get("medium_url")
+        or image_obj.get("screen_large_url")
+        or image_obj.get("small_url")
+        or ""
+    )
+
+def _cv_clean_text(raw: str, max_len: int = 320) -> str:
+    import html as _html
+    import re as _re
+
+    text = _html.unescape(raw or "")
+    text = _re.sub(r"<br\s*/?>", "\n", text, flags=_re.I)
+    text = _re.sub(r"</p\s*>", "\n", text, flags=_re.I)
+    text = _re.sub(r"<[^>]+>", " ", text)
+    text = _re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_len:
+        text = text[: max_len - 1].rstrip() + "…"
+    return text
+
+def _cv_month_bounds(target: datetime | None = None) -> tuple[str, str, str]:
+    import calendar as _cal
+
+    target = target or datetime.utcnow()
+    last_day = _cal.monthrange(target.year, target.month)[1]
+    start = f"{target.year}-{target.month:02d}-01"
+    end = f"{target.year}-{target.month:02d}-{last_day:02d}"
+    label = target.strftime("%B %Y")
+    return start, end, label
+
+def _cv_normalize_issue(raw: dict) -> dict:
+    vol = raw.get("volume") or {}
+    return {
+        "id": raw.get("id", 0),
+        "title": f"{vol.get('name', '?')} #{raw.get('issue_number', '?')}",
+        "name": raw.get("name") or "",
+        "date": (raw.get("cover_date") or "")[:10],
+        "store": (raw.get("store_date") or "")[:10],
+        "image": _cv_extract_image(raw.get("image")),
+        "url": raw.get("site_detail_url", ""),
+        "api_detail_url": raw.get("api_detail_url", ""),
+        "desc": _cv_clean_text(raw.get("description") or raw.get("deck") or "", 320),
+        "pub": "",
+        "writers": "",
+        "artists": "",
+        "chars": "",
+        "volume": vol,
+    }
 
 async def _cv_request(endpoint: str, params: dict) -> dict:
-    """Appel générique à l'API ComicVine."""
+    params = dict(params)
     params["api_key"] = COMICVINE_API_KEY
-    params["format"]  = "json"
+    params["format"] = "json"
     async with aiohttp.ClientSession() as s:
         async with s.get(
             f"{COMICVINE_BASE}/{endpoint}",
             params=params,
             headers=COMICVINE_HEADERS,
-            timeout=aiohttp.ClientTimeout(total=30)
+            timeout=aiohttp.ClientTimeout(total=30),
         ) as r:
             if r.status != 200:
                 return {}
             return await r.json()
 
-async def _fetch_cv_issues(publisher_filter: str = "", limit: int = 20, query: str = "") -> list[dict]:
-    """Récupère les dernières sorties depuis ComicVine."""
-    now        = datetime.utcnow()
-    # Fenêtre de 3 mois glissants
-    date_start = now.strftime("%Y-%m-01 00:00:00") if now.month > 1 else f"{now.year-1}-11-01 00:00:00"
-    date_end   = now.strftime("%Y-%m-28 23:59:59")
+async def _cv_request_url(url: str, params: dict) -> dict:
+    params = dict(params)
+    params["api_key"] = COMICVINE_API_KEY
+    params["format"] = "json"
+    async with aiohttp.ClientSession() as s:
+        async with s.get(
+            url,
+            params=params,
+            headers=COMICVINE_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as r:
+            if r.status != 200:
+                return {}
+            return await r.json()
 
-    params = {
-        "sort":       "cover_date:desc",
-        "limit":      limit,
-        "field_list": "name,issue_number,cover_date,image,site_detail_url,volume,store_date,description,person_credits",
+async def _cv_get_volume_publisher(volume: dict) -> dict:
+    volume = volume or {}
+    volume_id = int(volume.get("id") or 0)
+    if not volume_id:
+        return {}
+    if volume_id in cv_volume_publisher_cache:
+        return cv_volume_publisher_cache[volume_id]
+
+    publisher = volume.get("publisher") or {}
+    if isinstance(publisher, dict) and publisher.get("id"):
+        cv_volume_publisher_cache[volume_id] = publisher
+        return publisher
+
+    detail_url = volume.get("api_detail_url") or _cv_resource_url("volume", volume_id)
+    data = await _cv_request_url(detail_url, {"field_list": "publisher"})
+    result = data.get("results") or {}
+    publisher = result.get("publisher") or {}
+    publisher = publisher if isinstance(publisher, dict) else {}
+    cv_volume_publisher_cache[volume_id] = publisher
+    return publisher
+
+async def _cv_issue_matches_publisher(issue: dict, publisher_id: int) -> bool:
+    pub = await _cv_get_volume_publisher(issue.get("volume") or {})
+    return int(pub.get("id") or 0) == publisher_id
+
+async def _cv_enrich_issue(issue: dict) -> dict:
+    issue_id = int(issue.get("id") or 0)
+    if issue_id in cv_issue_detail_cache:
+        enriched = dict(issue)
+        enriched.update(cv_issue_detail_cache[issue_id])
+        return enriched
+
+    detail_url = issue.get("api_detail_url") or _cv_resource_url("issue", issue_id)
+    data = await _cv_request_url(
+        detail_url,
+        {
+            "field_list": ",".join(
+                [
+                    "id",
+                    "name",
+                    "issue_number",
+                    "cover_date",
+                    "store_date",
+                    "image",
+                    "site_detail_url",
+                    "volume",
+                    "description",
+                    "deck",
+                    "person_credits",
+                    "character_credits",
+                ]
+            )
+        },
+    )
+    raw = data.get("results") or {}
+    if not raw:
+        return issue
+
+    vol = raw.get("volume") or issue.get("volume") or {}
+    pub = await _cv_get_volume_publisher(vol)
+    persons = raw.get("person_credits") or []
+    characters = raw.get("character_credits") or []
+
+    detail = {
+        "title": f"{vol.get('name', '?')} #{raw.get('issue_number', '?')}",
+        "name": raw.get("name") or issue.get("name") or "",
+        "date": (raw.get("cover_date") or issue.get("date") or "")[:10],
+        "store": (raw.get("store_date") or issue.get("store") or "")[:10],
+        "image": _cv_extract_image(raw.get("image")) or issue.get("image", ""),
+        "url": raw.get("site_detail_url") or issue.get("url", ""),
+        "api_detail_url": detail_url,
+        "desc": _cv_clean_text(raw.get("description") or raw.get("deck") or issue.get("desc") or "", 420),
+        "pub": pub.get("name", ""),
+        "writers": ", ".join(
+            p.get("name", "")
+            for p in persons
+            if "writer" in (p.get("role", "") or "").lower()
+        )[:150],
+        "artists": ", ".join(
+            p.get("name", "")
+            for p in persons
+            if any(
+                role in (p.get("role", "") or "").lower()
+                for role in ["artist", "penciler", "penciller", "inker", "cover"]
+            )
+        )[:150],
+        "chars": ", ".join(c.get("name", "") for c in characters[:6]),
+        "volume": vol,
     }
-    if query:
-        params["filter"] = f"name:{query},cover_date:{date_start}|{date_end}"
-    elif publisher_filter:
-        params["filter"] = f"cover_date:{date_start}|{date_end}"
-    else:
-        params["filter"] = f"cover_date:{date_start}|{date_end}"
-
-    data = await _cv_request("issues", params)
-    results = []
-    for c in data.get("results", []):
-        vol    = c.get("volume", {}) or {}
-        image  = (c.get("image") or {}).get("medium_url", "")
-        # Filtrer par publisher si demandé (Marvel = 31, DC = 10)
-        results.append({
-            "title":    f"{vol.get('name','?')} #{c.get('issue_number','?')}",
-            "name":     c.get("name") or "",
-            "date":     c.get("cover_date","")[:10] if c.get("cover_date") else "",
-            "store":    c.get("store_date","")[:10] if c.get("store_date") else "",
-            "image":    image,
-            "url":      c.get("site_detail_url",""),
-            "desc":     (c.get("description","") or "")[:200].replace("<p>","").replace("</p>","").replace("<b>","**").replace("</b>","**")[:150],
-        })
-    return results
+    cv_issue_detail_cache[issue_id] = detail
+    enriched = dict(issue)
+    enriched.update(detail)
+    return enriched
 
 async def _fetch_cv_this_month(publisher_id: int, limit: int = 10) -> list[dict]:
-    """
-    Récupère les issues récentes en passant par l'endpoint publisher.
-    Marvel = 4010-31, DC = 4010-10
-    On appelle /issues/ en filtrant sur volume_ids issus du publisher.
-    """
-    import re as _re, calendar as _cal
-    now       = datetime.utcnow()
-    # 3 derniers mois
-    if now.month > 3:
-        date_start = f"{now.year}-{now.month-3:02d}-01"
-    else:
-        date_start = f"{now.year-1}-{now.month+9:02d}-01"
-    last_day  = _cal.monthrange(now.year, now.month)[1]
-    date_end  = f"{now.year}-{now.month:02d}-{last_day}"
+    start, end, _ = _cv_month_bounds()
+    seen_ids: set[int] = set()
+    candidates: list[dict] = []
 
-    # Titres emblématiques par publisher pour filtrer via name
-    name_filters = {
-        31: "Spider-Man,Avengers,X-Men,Deadpool,Thor,Iron Man,Wolverine,Captain America",
-        10: "Batman,Superman,Wonder Woman,Flash,Nightwing,Green Lantern,Justice League,Aquaman",
-    }
-    name_filter = name_filters.get(publisher_id, "")
-    
-    results = []
-    seen_ids = set()
-    
-    # Chercher par nom de série avec filtre date
-    for name in name_filter.split(","):
-        if len(results) >= limit:
-            break
-        name = name.strip()
-        params = {
-            "sort":       "cover_date:desc",
-            "limit":      10,
-            "filter":     f"name:{name},cover_date:{date_start}|{date_end}",
-            "field_list": "id,name,issue_number,cover_date,store_date,image,site_detail_url,volume,description,person_credits,character_credits",
-        }
-        try:
+    for date_field in ("store_date", "cover_date"):
+        offset = 0
+        while len(candidates) < limit * 3 and offset <= 200:
+            params = {
+                "sort": f"{date_field}:desc",
+                "limit": 100,
+                "offset": offset,
+                "filter": f"{date_field}:{start} 00:00:00|{end} 23:59:59",
+                "field_list": "id,name,issue_number,cover_date,store_date,image,site_detail_url,api_detail_url,volume",
+            }
             data = await _cv_request("issues", params)
-            for c in data.get("results", []):
-                cid = c.get("id")
-                if cid in seen_ids:
+            batch = data.get("results") or []
+            if not batch:
+                break
+            for raw in batch:
+                issue = _cv_normalize_issue(raw)
+                issue_id = int(issue.get("id") or 0)
+                if not issue_id or issue_id in seen_ids:
                     continue
-                # Vérification publisher via le nom du volume
-                vol     = c.get("volume", {}) or {}
-                pub_obj = vol.get("publisher") or {}
-                pub_id_api = pub_obj.get("id", 0) if isinstance(pub_obj, dict) else 0
-                pub_nm     = (pub_obj.get("name","") if isinstance(pub_obj, dict) else "").lower()
-                # Accepter si l'ID correspond OU si le nom contient marvel/dc
-                if publisher_id == 31 and pub_id_api and pub_id_api != 31 and "marvel" not in pub_nm:
+                if not await _cv_issue_matches_publisher(issue, publisher_id):
                     continue
-                if publisher_id == 10 and pub_id_api and pub_id_api != 10 and "dc" not in pub_nm:
-                    continue
-                seen_ids.add(cid)
-                img_obj = c.get("image") or {}
-                image   = (img_obj.get("original_url") or img_obj.get("medium_url") or "")
-                desc    = _re.sub(r"<[^>]+>", "", (c.get("description","") or "")).strip()[:300]
-                persons = c.get("person_credits") or []
-                writers = ", ".join(p["name"] for p in persons if "writer" in (p.get("role","")).lower())[:100]
-                artists = ", ".join(p["name"] for p in persons if any(r in (p.get("role","")).lower() for r in ["penciler","artist","penciller"]))[:100]
-                chars   = c.get("character_credits") or []
-                results.append({
-                    "title":   f"{vol.get('name','?')} #{c.get('issue_number','?')}",
-                    "name":    c.get("name") or "",
-                    "date":    (c.get("cover_date","") or "")[:10],
-                    "store":   (c.get("store_date","") or "")[:10],
-                    "image":   image,
-                    "url":     c.get("site_detail_url",""),
-                    "desc":    desc,
-                    "writers": writers,
-                    "artists": artists,
-                    "chars":   ", ".join(ch["name"] for ch in chars[:5]),
-                    "pub":     pub_obj.get("name","") if isinstance(pub_obj, dict) else "",
-                })
-                if len(results) >= limit:
+                seen_ids.add(issue_id)
+                candidates.append(issue)
+                if len(candidates) >= limit * 3:
                     break
-            await asyncio.sleep(0.3)  # respecter le rate limit
-        except Exception as e:
-            print(f"⚠️ Comics fetch error ({name}): {e}")
-            continue
+            if len(batch) < 100:
+                break
+            offset += 100
+            await asyncio.sleep(0.25)
+
+    candidates.sort(key=lambda item: (item.get("store") or item.get("date") or ""), reverse=True)
+    results = []
+    for issue in candidates[:limit]:
+        results.append(await _cv_enrich_issue(issue))
+        await asyncio.sleep(0.15)
     return results
 
-
 async def _fetch_cv_search(query: str, publisher_id: int = 0, limit: int = 15) -> list[dict]:
-    """Recherche de comics sur ComicVine — triés du plus récent au plus ancien."""
-    import re as _re
     params = {
-        "query":      query,
-        "resources":  "issue",
-        "limit":      min(limit * 3, 50),  # On récupère plus pour avoir assez après filtre
-        "field_list": "name,issue_number,cover_date,image,site_detail_url,volume,store_date,description,person_credits,character_credits",
+        "query": query,
+        "resources": "issue",
+        "limit": min(limit * 4, 40),
+        "field_list": "id,name,issue_number,cover_date,store_date,image,site_detail_url,api_detail_url,volume,description,deck",
     }
     data = await _cv_request("search", params)
     results = []
-    for c in data.get("results", []):
-        vol     = c.get("volume", {}) or {}
-        img_obj = c.get("image") or {}
-        image   = (img_obj.get("original_url") or img_obj.get("medium_url") or img_obj.get("small_url") or "")
-        pub     = (vol.get("publisher") or {})
-        pub_id  = pub.get("id", 0) if isinstance(pub, dict) else 0
-        if publisher_id and pub_id and pub_id != publisher_id:
+    for raw in data.get("results", []):
+        issue = _cv_normalize_issue(raw)
+        if publisher_id and not await _cv_issue_matches_publisher(issue, publisher_id):
             continue
-        cover = c.get("cover_date","") or ""
-        # Nettoyer la description HTML
-        desc_raw = (c.get("description","") or "")
-        desc = _re.sub(r"<[^>]+>", "", desc_raw).strip()
-        desc = desc[:300] if desc else ""
-        # Crédits
-        persons = c.get("person_credits") or []
-        writers  = ", ".join(p["name"] for p in persons if "writer" in (p.get("role","")).lower())[:100]
-        artists  = ", ".join(p["name"] for p in persons if any(r in (p.get("role","")).lower() for r in ["penciler","artist","penciller"]))[:100]
-        chars    = c.get("character_credits") or []
-        char_str = ", ".join(ch["name"] for ch in chars[:5])
-        results.append({
-            "title":   f"{vol.get('name','?')} #{c.get('issue_number','?')}",
-            "name":    c.get("name") or "",
-            "date":    c.get("cover_date","")[:10],
-            "store":   c.get("store_date","")[:10] if c.get("store_date") else "",
-            "image":   image,
-            "url":     c.get("site_detail_url",""),
-            "desc":    desc,
-            "pub":     pub.get("name","") if isinstance(pub, dict) else "",
-            "writers": writers,
-            "artists": artists,
-            "chars":   char_str,
-        })
-    # Trier du plus récent (2026) au plus ancien
-    results.sort(key=lambda x: x.get("date","0000-00-00"), reverse=True)
+        results.append(await _cv_enrich_issue(issue))
+        if len(results) >= limit:
+            break
+        await asyncio.sleep(0.1)
+    results.sort(key=lambda item: (item.get("store") or item.get("date") or ""), reverse=True)
     return results[:limit]
 
+def _cv_embed(comic: dict, title: str, color: int, page: int, total: int) -> discord.Embed:
+    headline = comic["title"]
+    if comic.get("name"):
+        headline += f" — {comic['name']}"
 
-def _cv_embed(comics: list[dict], title: str, color: int, page: int, total: int) -> discord.Embed:
     embed = discord.Embed(
-        title=title,
-        description=f"*Page {page}/{total} • Données ComicVine*",
+        title=headline[:256],
+        url=comic.get("url") or None,
+        description=comic.get("desc") or "Aucune description disponible.",
         color=color,
-        timestamp=datetime.utcnow()
+        timestamp=datetime.utcnow(),
     )
-    for c in comics:
-        name  = c["title"]
-        if c.get("name"):
-            name += f" — {c['name']}"
-        val = ""
-        if c.get("date"):
-            val += f"📅 `{c['date']}`"
-        if c.get("store"):
-            val += f" • 🏪 `{c['store']}`"
-        if c.get("pub"):
-            val += f" • 🏢 {c['pub']}"
-        if c.get("desc"):
-            val += f"\n*{c['desc'][:120]}...*" if len(c.get("desc","")) > 120 else f"\n*{c['desc']}*"
-        if c.get("url"):
-            val += f"\n[Voir sur ComicVine]({c['url']})"
-        embed.add_field(name=name[:256], value=val[:1024] or "—", inline=False)
-    if comics and comics[0].get("image"):
-        embed.set_thumbnail(url=comics[0]["image"])
+    embed.set_author(name=f"{title} • {page}/{total}")
+    meta_bits = []
+    if comic.get("pub"):
+        meta_bits.append(comic["pub"])
+    if comic.get("date"):
+        meta_bits.append(f"Cover {comic['date']}")
+    if comic.get("store"):
+        meta_bits.append(f"Sortie {comic['store']}")
+    if meta_bits:
+        embed.add_field(name="📚 Infos", value=" • ".join(meta_bits)[:1024], inline=False)
+    if comic.get("writers"):
+        embed.add_field(name="✍️ Scénario", value=comic["writers"][:1024], inline=True)
+    if comic.get("artists"):
+        embed.add_field(name="🎨 Art / Cover", value=comic["artists"][:1024], inline=True)
+    if comic.get("chars"):
+        embed.add_field(name="🦸 Personnages", value=comic["chars"][:1024], inline=False)
+    if comic.get("image"):
+        embed.set_image(url=comic["image"])
     embed.set_footer(text="ComicVine API • comicvine.gamespot.com")
     return embed
 
-
 class CVPageView(discord.ui.View):
     def __init__(self, comics: list[dict], title: str, color: int):
-        super().__init__(timeout=120)
-        self.comics   = comics
-        self.title    = title
-        self.color    = color
-        self.page     = 1
-        self.per_page = 4
-        self.total    = max(1, (len(comics) + self.per_page - 1) // self.per_page)
+        super().__init__(timeout=180)
+        self.comics = comics
+        self.title = title
+        self.color = color
+        self.page = 1
+        self.total = max(1, len(comics))
         self._sync_btns()
 
     def _sync_btns(self):
@@ -4274,19 +4357,20 @@ class CVPageView(discord.ui.View):
         self.next.disabled = self.page >= self.total
 
     def _embed(self):
-        s = (self.page - 1) * self.per_page
-        return _cv_embed(self.comics[s:s+self.per_page], self.title, self.color, self.page, self.total)
+        comic = self.comics[self.page - 1]
+        return _cv_embed(comic, self.title, self.color, self.page, self.total)
 
     @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
     async def prev(self, interaction: discord.Interaction, btn):
-        self.page -= 1; self._sync_btns()
+        self.page -= 1
+        self._sync_btns()
         await interaction.response.edit_message(embed=self._embed(), view=self)
 
     @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
     async def next(self, interaction: discord.Interaction, btn):
-        self.page += 1; self._sync_btns()
+        self.page += 1
+        self._sync_btns()
         await interaction.response.edit_message(embed=self._embed(), view=self)
-
 
 def _no_api_embed() -> discord.Embed:
     return discord.Embed(
@@ -4299,8 +4383,290 @@ def _no_api_embed() -> discord.Embed:
             "**Sur Railway :** ajoute la variable :\n"
             "```\nCOMICVINE_API_KEY=ta_clé_ici\n```"
         ),
-        color=0xED4245
+        color=0xED4245,
     )
+
+GACHA_RARITY_META = {
+    "Commun": {"emoji": "⚪", "color": 0xBDC3C7},
+    "Rare": {"emoji": "🔵", "color": 0x3498DB},
+    "Epique": {"emoji": "🟣", "color": 0x9B59B6},
+    "Legendaire": {"emoji": "🟡", "color": 0xF1C40F},
+    "Mythique": {"emoji": "🔥", "color": 0xE67E22},
+}
+GACHA_RARITY_ORDER = ["Mythique", "Legendaire", "Epique", "Rare", "Commun"]
+
+async def _send_comic_release_batch(channel: discord.abc.Messageable, comics: list[dict], publisher_id: int, heading: str):
+    meta = _publisher_meta(publisher_id)
+    intro = discord.Embed(
+        title=f"{meta['emoji']} {heading}",
+        description=f"**{len(comics)} sorties** récupérées avec cover et détails enrichis.",
+        color=meta["color"],
+        timestamp=datetime.utcnow(),
+    )
+    intro.set_footer(text="ComicVine API • sorties du mois")
+    await channel.send(embed=intro)
+    for index, comic in enumerate(comics, start=1):
+        await channel.send(embed=_cv_embed(comic, heading, meta["color"], index, len(comics)))
+        await asyncio.sleep(0.5)
+
+def _gacha_get_profile(user_id: int) -> dict:
+    profile = gacha_profiles.setdefault(
+        user_id,
+        {
+            "pulls": 0,
+            "last_pull_at": {},
+            "pity": {},
+            "items": {},
+        },
+    )
+    profile.setdefault("pulls", 0)
+    profile.setdefault("last_pull_at", {})
+    profile.setdefault("pity", {})
+    profile.setdefault("items", {})
+    return profile
+
+def _gacha_rarity_for_index(index: int, total: int) -> str:
+    ratio = index / max(total - 1, 1)
+    if ratio <= 0.02:
+        return "Mythique"
+    if ratio <= 0.10:
+        return "Legendaire"
+    if ratio <= 0.28:
+        return "Epique"
+    if ratio <= 0.55:
+        return "Rare"
+    return "Commun"
+
+async def _cv_fetch_character_pool(publisher_id: int, max_items: int = 180) -> list[dict]:
+    cached = cv_character_pool_cache.get(publisher_id)
+    now_ts = datetime.utcnow().timestamp()
+    if cached and now_ts - cached.get("ts", 0) < 6 * 3600:
+        return cached.get("items", [])
+
+    items: list[dict] = []
+    seen_ids: set[int] = set()
+    for offset in range(0, max_items, 100):
+        params = {
+            "sort": "count_of_issue_appearances:desc",
+            "limit": 100,
+            "offset": offset,
+            "filter": f"publisher:{publisher_id}",
+            "field_list": "id,name,real_name,image,deck,site_detail_url,count_of_issue_appearances,publisher",
+        }
+        data = await _cv_request("characters", params)
+        batch = data.get("results") or []
+        if not batch:
+            break
+        for raw in batch:
+            cid = int(raw.get("id") or 0)
+            if not cid or cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+            items.append(
+                {
+                    "id": cid,
+                    "name": raw.get("name") or "Inconnu",
+                    "real_name": raw.get("real_name") or "",
+                    "image": _cv_extract_image(raw.get("image")),
+                    "url": raw.get("site_detail_url") or "",
+                    "desc": _cv_clean_text(raw.get("deck") or "", 220),
+                    "appearances": int(raw.get("count_of_issue_appearances") or 0),
+                    "publisher_id": publisher_id,
+                    "publisher": _publisher_meta(publisher_id)["name"],
+                }
+            )
+        if len(batch) < 100:
+            break
+        await asyncio.sleep(0.25)
+
+    for index, item in enumerate(items):
+        item["rarity"] = _gacha_rarity_for_index(index, len(items))
+
+    cv_character_pool_cache[publisher_id] = {"ts": now_ts, "items": items}
+    return items
+
+def _gacha_roll_rarity(available_rarities: list[str], pity: int) -> str:
+    weights = {
+        "Commun": 50,
+        "Rare": 27,
+        "Epique": 14,
+        "Legendaire": 7,
+        "Mythique": 2,
+    }
+    if pity >= GACHA_PITY_THRESHOLD:
+        weights["Commun"] = 0
+        weights["Rare"] = 0
+        weights["Epique"] = 55
+        weights["Legendaire"] = 35
+        weights["Mythique"] = 10
+
+    population = [rarity for rarity in GACHA_RARITY_ORDER if rarity in available_rarities]
+    selected = random.choices(population, weights=[weights[rarity] for rarity in population], k=1)[0]
+    return selected
+
+def _gacha_seconds_left(profile: dict, universe_slug: str) -> int:
+    last_pull = float(profile.get("last_pull_at", {}).get(universe_slug, 0) or 0)
+    remaining = int(GACHA_COOLDOWN - (datetime.utcnow().timestamp() - last_pull))
+    return max(0, remaining)
+
+def _gacha_item_sort_key(item: dict):
+    rarity_index = GACHA_RARITY_ORDER.index(item.get("rarity", "Commun")) if item.get("rarity", "Commun") in GACHA_RARITY_ORDER else len(GACHA_RARITY_ORDER)
+    return (rarity_index, -int(item.get("count", 1)), item.get("name", ""))
+
+@tree.command(name="gachapull", description="🎴 Invoque un personnage Marvel ou DC")
+@app_commands.choices(univers=[
+    app_commands.Choice(name="Marvel", value="marvel"),
+    app_commands.Choice(name="DC Comics", value="dc"),
+])
+async def slash_gacha_pull(interaction: discord.Interaction, univers: str):
+    await interaction.response.defer()
+    if not COMICVINE_API_KEY:
+        await interaction.followup.send(embed=_no_api_embed())
+        return
+
+    publisher_id = 31 if univers == "marvel" else 10
+    meta = _publisher_meta(publisher_id)
+    profile = _gacha_get_profile(interaction.user.id)
+    time_left = _gacha_seconds_left(profile, univers)
+    if time_left > 0:
+        minutes, seconds = divmod(time_left, 60)
+        await interaction.followup.send(
+            f"⏳ Ton prochain pull {meta['name']} sera disponible dans **{minutes}m {seconds:02d}s**.",
+            ephemeral=True,
+        )
+        return
+
+    pool = await _cv_fetch_character_pool(publisher_id)
+    if not pool:
+        await interaction.followup.send(f"❌ Impossible de charger le pool gacha {meta['name']} pour le moment.")
+        return
+
+    pity_map = profile.setdefault("pity", {})
+    pity_before = int(pity_map.get(univers, 0) or 0)
+    buckets: dict[str, list[dict]] = {}
+    for item in pool:
+        buckets.setdefault(item["rarity"], []).append(item)
+    target_rarity = _gacha_roll_rarity(list(buckets.keys()), pity_before)
+    pulled = random.choice(buckets[target_rarity])
+
+    items = profile.setdefault("items", {})
+    key = f"{publisher_id}:{pulled['id']}"
+    stored = items.get(key)
+    duplicate_count = 1
+    if stored:
+        stored["count"] = int(stored.get("count", 1)) + 1
+        duplicate_count = stored["count"]
+    else:
+        stored = {
+            "id": pulled["id"],
+            "name": pulled["name"],
+            "real_name": pulled.get("real_name", ""),
+            "image": pulled.get("image", ""),
+            "url": pulled.get("url", ""),
+            "desc": pulled.get("desc", ""),
+            "appearances": pulled.get("appearances", 0),
+            "publisher_id": publisher_id,
+            "publisher": pulled.get("publisher", meta["name"]),
+            "rarity": pulled["rarity"],
+            "count": 1,
+        }
+        items[key] = stored
+
+    profile["pulls"] = int(profile.get("pulls", 0)) + 1
+    profile.setdefault("last_pull_at", {})[univers] = datetime.utcnow().timestamp()
+    pity_map[univers] = 0 if pulled["rarity"] in ("Legendaire", "Mythique") else pity_before + 1
+    save_data()
+
+    rarity_meta = GACHA_RARITY_META[pulled["rarity"]]
+    embed = discord.Embed(
+        title=f"{rarity_meta['emoji']} Pull {meta['name']} — {pulled['rarity']}",
+        description=pulled.get("desc") or "Aucune description disponible pour ce personnage.",
+        color=rarity_meta["color"],
+        timestamp=datetime.utcnow(),
+        url=pulled.get("url") or None,
+    )
+    name_line = pulled["name"]
+    if pulled.get("real_name"):
+        name_line += f" ({pulled['real_name']})"
+    embed.add_field(name="🧬 Personnage", value=name_line[:1024], inline=False)
+    embed.add_field(name="📚 Univers", value=meta["name"], inline=True)
+    embed.add_field(name="📖 Apparitions", value=str(pulled.get("appearances", 0)), inline=True)
+    embed.add_field(name="🗂️ Exemplaires", value=str(duplicate_count), inline=True)
+    embed.add_field(name="🎯 Pity", value=f"{pity_map[univers]}/{GACHA_PITY_THRESHOLD}", inline=True)
+    if pulled.get("image"):
+        embed.set_image(url=pulled["image"])
+    embed.set_footer(text=f"Gacha {meta['name']} • prochaines invocations dans {GACHA_COOLDOWN // 3600}h")
+    await interaction.followup.send(embed=embed)
+
+@tree.command(name="gachacollection", description="📚 Affiche la collection gacha Marvel/DC")
+@app_commands.choices(univers=[
+    app_commands.Choice(name="Tout", value="all"),
+    app_commands.Choice(name="Marvel", value="marvel"),
+    app_commands.Choice(name="DC Comics", value="dc"),
+])
+async def slash_gacha_collection(
+    interaction: discord.Interaction,
+    univers: str = "all",
+    membre: discord.Member = None,
+):
+    target = membre or interaction.user
+    profile = gacha_profiles.get(target.id)
+    if not profile or not profile.get("items"):
+        await interaction.response.send_message(f"📭 {target.mention} n'a encore aucune carte gacha.", ephemeral=True)
+        return
+
+    publisher_filter = 0
+    if univers == "marvel":
+        publisher_filter = 31
+    elif univers == "dc":
+        publisher_filter = 10
+
+    items = list(profile.get("items", {}).values())
+    if publisher_filter:
+        items = [item for item in items if int(item.get("publisher_id", 0)) == publisher_filter]
+    if not items:
+        await interaction.response.send_message("📭 Aucune carte dans cette collection pour cet univers.", ephemeral=True)
+        return
+
+    items.sort(key=_gacha_item_sort_key)
+    counts_by_rarity = {rarity: 0 for rarity in GACHA_RARITY_ORDER}
+    total_copies = 0
+    for item in items:
+        counts_by_rarity[item.get("rarity", "Commun")] += int(item.get("count", 1))
+        total_copies += int(item.get("count", 1))
+
+    title = "🎴 Collection Gacha"
+    if publisher_filter:
+        title += f" — {_publisher_meta(publisher_filter)['name']}"
+    embed = discord.Embed(
+        title=title,
+        description=f"Collection de {target.mention}",
+        color=0x8B0000,
+        timestamp=datetime.utcnow(),
+    )
+    embed.add_field(name="🧾 Cartes uniques", value=str(len(items)), inline=True)
+    embed.add_field(name="📦 Copies totales", value=str(total_copies), inline=True)
+    embed.add_field(name="🎰 Pulls", value=str(profile.get("pulls", 0)), inline=True)
+
+    rarity_summary = []
+    for rarity in GACHA_RARITY_ORDER:
+        count = counts_by_rarity.get(rarity, 0)
+        if count:
+            rarity_summary.append(f"{GACHA_RARITY_META[rarity]['emoji']} {rarity}: {count}")
+    embed.add_field(name="✨ Raretés", value="\n".join(rarity_summary)[:1024], inline=False)
+
+    lines = []
+    for item in items[:10]:
+        rarity = item.get("rarity", "Commun")
+        emoji = GACHA_RARITY_META.get(rarity, GACHA_RARITY_META["Commun"])["emoji"]
+        lines.append(
+            f"{emoji} **{item.get('name', 'Inconnu')}** x{int(item.get('count', 1))}"
+            f" • {item.get('publisher', 'Comics')}"
+        )
+    embed.add_field(name="🗃️ Top collection", value="\n".join(lines)[:1024], inline=False)
+    if len(items) > 10:
+        embed.set_footer(text=f"{len(items) - 10} carte(s) supplémentaire(s) non affichée(s)")
+    await interaction.response.send_message(embed=embed)
 
 
 @tree.command(name="marvelcomics", description="📚 Dernières sorties Marvel du mois (ComicVine)")
@@ -4310,12 +4676,15 @@ async def slash_marvel_comics(interaction: discord.Interaction, recherche: str =
     if not COMICVINE_API_KEY:
         await interaction.followup.send(embed=_no_api_embed()); return
 
+    _, _, month_label = _cv_month_bounds()
+    meta = _publisher_meta(31)
+
     if recherche:
         comics = await _fetch_cv_search(recherche, publisher_id=31)
-        titre  = f"🔴 Marvel — Recherche : {recherche}"
+        titre  = f"{meta['emoji']} {meta['name']} — Recherche : {recherche}"
     else:
         comics = await _fetch_cv_this_month(publisher_id=31, limit=20)
-        titre  = "🔴 Dernières sorties Marvel — " + datetime.utcnow().strftime("%B %Y")
+        titre  = f"{meta['emoji']} Sorties du mois {meta['name']} — {month_label}"
 
     if not comics:
         await interaction.followup.send("❌ Aucun résultat. Réessaie dans quelques instants."); return
@@ -4331,12 +4700,15 @@ async def slash_dc_comics(interaction: discord.Interaction, recherche: str = "")
     if not COMICVINE_API_KEY:
         await interaction.followup.send(embed=_no_api_embed()); return
 
+    _, _, month_label = _cv_month_bounds()
+    meta = _publisher_meta(10)
+
     if recherche:
         comics = await _fetch_cv_search(recherche, publisher_id=10)
-        titre  = f"🔵 DC Comics — Recherche : {recherche}"
+        titre  = f"{meta['emoji']} {meta['name']} — Recherche : {recherche}"
     else:
         comics = await _fetch_cv_this_month(publisher_id=10, limit=20)
-        titre  = "🔵 Dernières sorties DC Comics — " + datetime.utcnow().strftime("%B %Y")
+        titre  = f"{meta['emoji']} Sorties du mois {meta['name']} — {month_label}"
 
     if not comics:
         await interaction.followup.send("❌ Aucun résultat DC trouvé."); return
@@ -4376,9 +4748,11 @@ async def comics_auto_loop():
     if not COMICVINE_API_KEY:
         return
 
-    for publisher, channel_id, color, emoji, search_term, pub_id in [
-        ("Marvel", MARVEL_CHANNEL_ID, 0xEC1D24, "🔴", "Marvel", 31),
-        ("DC",     DC_CHANNEL_ID,     0x0075C8, "🔵", "DC Comics", 10),
+    _, _, month_label = _cv_month_bounds()
+
+    for publisher, channel_id, pub_id in [
+        ("Marvel", MARVEL_CHANNEL_ID, 31),
+        ("DC",     DC_CHANNEL_ID,     10),
     ]:
         if not channel_id:
             continue
@@ -4392,51 +4766,14 @@ async def comics_auto_loop():
                     continue
 
                 # Vérifier s'il y a du nouveau depuis le dernier post
-                top_date = comics[0].get("date","") if comics else ""
+                top_date = comics[0].get("store") or comics[0].get("date", "")
                 last     = comics_last_posted.get(publisher, "")
                 if top_date and top_date == last:
                     continue  # rien de nouveau
 
                 comics_last_posted[publisher] = top_date
                 mark_data_dirty()
-
-                # Message d'intro
-                intro = discord.Embed(
-                    title=f"{emoji} Nouvelles sorties {publisher} — {datetime.utcnow().strftime('%d/%m/%Y')} !",
-                    description=f"**{len(comics[:6])} nouveaux comics** détectés cette semaine ! 📚",
-                    color=color,
-                    timestamp=datetime.utcnow()
-                )
-                intro.set_footer(text=f"Mis à jour automatiquement toutes les {COMICS_INTERVAL}h • ComicVine")
-                await ch.send(embed=intro)
-
-                # Un embed par comic avec grande image
-                for c in comics[:6]:
-                    title = c["title"]
-                    if c.get("name"): title += f" — {c['name']}"
-                    em = discord.Embed(title=title[:256], color=color, timestamp=datetime.utcnow())
-                    # Description
-                    if c.get("desc"):
-                        em.description = c["desc"][:400]
-                    # Champs infos
-                    if c.get("date"):
-                        em.add_field(name="📅 Date de parution", value=f"`{c['date']}`", inline=True)
-                    if c.get("store"):
-                        em.add_field(name="🏪 En magasin le", value=f"`{c['store']}`", inline=True)
-                    if c.get("writers"):
-                        em.add_field(name="✍️ Scénariste", value=c["writers"], inline=True)
-                    if c.get("artists"):
-                        em.add_field(name="🎨 Dessinateur", value=c["artists"], inline=True)
-                    if c.get("chars"):
-                        em.add_field(name="🦸 Personnages", value=c["chars"], inline=False)
-                    if c.get("url"):
-                        em.add_field(name="🔗 Plus d'infos", value=f"[Voir sur ComicVine]({c['url']})", inline=False)
-                    # Grande image de couverture
-                    if c.get("image"):
-                        em.set_image(url=c["image"])
-                    em.set_footer(text=f"{publisher} • ComicVine")
-                    await ch.send(embed=em)
-                    await asyncio.sleep(0.5)  # éviter le rate limit
+                await _send_comic_release_batch(ch, comics[:6], pub_id, f"Sorties du mois {publisher} — {month_label}")
             except Exception as e:
                 print(f"⚠️ Erreur comics auto {publisher} : {e}")
 
@@ -4462,28 +4799,8 @@ async def slash_setmarvelchannel(interaction: discord.Interaction, salon: discor
     if COMICVINE_API_KEY:
         comics = await _fetch_cv_this_month(publisher_id=31, limit=6)
         if comics:
-            intro = discord.Embed(
-                title="🔴 Dernières sorties Marvel",
-                description=f"*Salon configuré ! Voici les **{len(comics)} dernières sorties**.*",
-                color=0xEC1D24, timestamp=datetime.utcnow()
-            )
-            intro.set_footer(text=f"Mis à jour automatiquement toutes les {COMICS_INTERVAL}h • ComicVine")
-            await salon.send(embed=intro)
-            for c in comics:
-                title = c["title"]
-                if c.get("name"): title += f" — {c['name']}"
-                em = discord.Embed(title=title[:256], color=0xEC1D24, timestamp=datetime.utcnow())
-                if c.get("desc"): em.description = c["desc"][:400]
-                if c.get("date"): em.add_field(name="📅 Parution", value=f"`{c['date']}`", inline=True)
-                if c.get("store"): em.add_field(name="🏪 En magasin", value=f"`{c['store']}`", inline=True)
-                if c.get("writers"): em.add_field(name="✍️ Scénariste", value=c["writers"], inline=True)
-                if c.get("artists"): em.add_field(name="🎨 Dessinateur", value=c["artists"], inline=True)
-                if c.get("chars"): em.add_field(name="🦸 Personnages", value=c["chars"], inline=False)
-                if c.get("url"): em.add_field(name="🔗 Plus d'infos", value=f"[Voir sur ComicVine]({c['url']})", inline=False)
-                if c.get("image"): em.set_image(url=c["image"])
-                em.set_footer(text="Marvel • ComicVine")
-                await salon.send(embed=em)
-                await asyncio.sleep(0.5)
+            _, _, month_label = _cv_month_bounds()
+            await _send_comic_release_batch(salon, comics, 31, f"Sorties du mois Marvel — {month_label}")
 
     await interaction.followup.send(
         f"✅ Salon Marvel configuré : {salon.mention}\n"
@@ -4507,28 +4824,8 @@ async def slash_setdcchannel(interaction: discord.Interaction, salon: discord.Te
     if COMICVINE_API_KEY:
         comics = await _fetch_cv_this_month(publisher_id=10, limit=6)
         if comics:
-            intro = discord.Embed(
-                title="🔵 Dernières sorties DC Comics",
-                description=f"*Salon configuré ! Voici les **{len(comics)} dernières sorties**.*",
-                color=0x0075C8, timestamp=datetime.utcnow()
-            )
-            intro.set_footer(text=f"Mis à jour automatiquement toutes les {COMICS_INTERVAL}h • ComicVine")
-            await salon.send(embed=intro)
-            for c in comics:
-                title = c["title"]
-                if c.get("name"): title += f" — {c['name']}"
-                em = discord.Embed(title=title[:256], color=0x0075C8, timestamp=datetime.utcnow())
-                if c.get("desc"): em.description = c["desc"][:400]
-                if c.get("date"): em.add_field(name="📅 Parution", value=f"`{c['date']}`", inline=True)
-                if c.get("store"): em.add_field(name="🏪 En magasin", value=f"`{c['store']}`", inline=True)
-                if c.get("writers"): em.add_field(name="✍️ Scénariste", value=c["writers"], inline=True)
-                if c.get("artists"): em.add_field(name="🎨 Dessinateur", value=c["artists"], inline=True)
-                if c.get("chars"): em.add_field(name="🦸 Personnages", value=c["chars"], inline=False)
-                if c.get("url"): em.add_field(name="🔗 Plus d'infos", value=f"[Voir sur ComicVine]({c['url']})", inline=False)
-                if c.get("image"): em.set_image(url=c["image"])
-                em.set_footer(text="DC Comics • ComicVine")
-                await salon.send(embed=em)
-                await asyncio.sleep(0.5)
+            _, _, month_label = _cv_month_bounds()
+            await _send_comic_release_batch(salon, comics, 10, f"Sorties du mois DC Comics — {month_label}")
 
     await interaction.followup.send(
         f"✅ Salon DC configuré : {salon.mention}\n"
