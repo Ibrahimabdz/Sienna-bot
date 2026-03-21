@@ -49,6 +49,7 @@ reaction_roles: dict = {}          # {msg_id: {emoji: role_id}}
 REGLEMENT_MSG_ID:     int = 0      # ID du message règlement
 REGLEMENT_CHANNEL_ID: int = 0      # ID du salon règlement
 gacha_profiles: dict[int, dict] = {}
+economy_profiles: dict[int, dict] = {}
 
 def save_data():
     """Sauvegarde les données persistantes du bot dans data.json."""
@@ -62,6 +63,7 @@ def save_data():
             "announced_games": list(announced_games),
             "comics_last_posted": comics_last_posted,
             "gacha_profiles": {str(k): v for k, v in gacha_profiles.items()},
+            "economy_profiles": {str(k): v for k, v in economy_profiles.items()},
             "config": {
                 "CONFESSION_CHANNEL_ID": CONFESSION_CHANNEL_ID,
                 "BOOST_CHANNEL_ID":       BOOST_CHANNEL_ID,
@@ -94,7 +96,7 @@ def load_data():
     """Charge toutes les données depuis data.json au démarrage"""
     global xp_data, warns, reaction_roles
     global open_tickets, announced_games, comics_last_posted
-    global gacha_profiles
+    global gacha_profiles, economy_profiles
     global _data_dirty
     global CONFESSION_CHANNEL_ID, confession_counter
     global WELCOME_CHANNEL_ID, GOODBYE_CHANNEL_ID, LOG_CHANNEL_ID
@@ -116,6 +118,7 @@ def load_data():
         announced_games = set(payload.get("announced_games", []))
         comics_last_posted = payload.get("comics_last_posted", {})
         gacha_profiles = {int(k): v for k, v in payload.get("gacha_profiles", {}).items()}
+        economy_profiles = {int(k): v for k, v in payload.get("economy_profiles", {}).items()}
         cfg = payload.get("config", {})
         CONFESSION_CHANNEL_ID = cfg.get("CONFESSION_CHANNEL_ID", CONFESSION_CHANNEL_ID)
         confession_counter    = cfg.get("confession_counter",    confession_counter)
@@ -209,6 +212,25 @@ GACHA_WINDOW_SECONDS = 3600
 GACHA_PULLS_PER_HOUR = 10
 GACHA_PITY_THRESHOLD = 20
 DISBOARD_BOT_ID = 302050872383242240
+
+# ── Quêtes & économie
+DAILY_QUEST_TEMPLATES = [
+    {"id": "daily_messages", "label": "Envoyer 20 messages", "type": "messages", "target": 20, "reward": 80, "scope": "daily"},
+    {"id": "daily_voice", "label": "Passer 30 min en vocal", "type": "voice_seconds", "target": 30 * 60, "reward": 120, "scope": "daily"},
+    {"id": "daily_gacha", "label": "Faire 3 pulls gacha", "type": "gacha_pulls", "target": 3, "reward": 70, "scope": "daily"},
+]
+WEEKLY_QUEST_TEMPLATES = [
+    {"id": "weekly_messages", "label": "Envoyer 120 messages", "type": "messages", "target": 120, "reward": 350, "scope": "weekly"},
+    {"id": "weekly_voice", "label": "Passer 3h en vocal", "type": "voice_seconds", "target": 3 * 3600, "reward": 450, "scope": "weekly"},
+    {"id": "weekly_gacha", "label": "Faire 12 pulls gacha", "type": "gacha_pulls", "target": 12, "reward": 250, "scope": "weekly"},
+]
+SHOP_ITEMS = {
+    "marvel_reset": {"label": "Reset Marvel", "price": 250, "description": "Remet ton quota Marvel à 0/10"},
+    "dc_reset": {"label": "Reset DC", "price": 250, "description": "Remet ton quota DC à 0/10"},
+    "all_reset": {"label": "Reset total", "price": 450, "description": "Remet Marvel et DC à 0/10"},
+    "marvel_pity": {"label": "Boost pity Marvel", "price": 300, "description": "Ajoute +3 pity sur Marvel"},
+    "dc_pity": {"label": "Boost pity DC", "price": 300, "description": "Ajoute +3 pity sur DC"},
+}
 
 # ════════════════════════════════════════════════════════════════
 #  🤖  [2] INTENTS & BOT
@@ -873,19 +895,23 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         # Quitté
         if uid in voice_join_time:
             start = voice_join_time.pop(uid)
+            duration = max(0, int(now - start))
             d = get_user_data(uid)
             d["voice_history"].append((start, now))
             cutoff = now - 14 * 86400
             d["voice_history"] = [(s, e) for s, e in d["voice_history"] if e >= cutoff]
+            _track_quest_progress(uid, "voice_seconds", duration)
             mark_data_dirty()
     elif before.channel and after.channel:
         # Changement de salon
         if uid in voice_join_time:
             start = voice_join_time[uid]
+            duration = max(0, int(now - start))
             d = get_user_data(uid)
             d["voice_history"].append((start, now))
             cutoff = now - 14 * 86400
             d["voice_history"] = [(s, e) for s, e in d["voice_history"] if e >= cutoff]
+            _track_quest_progress(uid, "voice_seconds", duration)
         voice_join_time[uid] = now
         d = get_user_data(uid)
         d["top_voice"][after.channel.name] = d["top_voice"].get(after.channel.name, 0) + 1
@@ -1003,6 +1029,7 @@ async def on_message(message: discord.Message):
         return
     now = datetime.utcnow().timestamp()
     uid = message.author.id
+    _track_quest_progress(uid, "messages", 1)
     if now - xp_cooldowns.get(uid, 0) >= XP_COOLDOWN:
         xp_cooldowns[uid] = now
         data   = get_user_data(uid)
@@ -4530,6 +4557,109 @@ def _no_api_embed() -> discord.Embed:
         color=0xED4245,
     )
 
+def _utc_day_key() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+def _utc_week_key() -> str:
+    iso = datetime.utcnow().isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
+
+def _quest_templates(scope: str) -> list[dict]:
+    return DAILY_QUEST_TEMPLATES if scope == "daily" else WEEKLY_QUEST_TEMPLATES
+
+def _quest_period_key(scope: str) -> str:
+    return _utc_day_key() if scope == "daily" else _utc_week_key()
+
+def _build_quest_entry(template: dict) -> dict:
+    return {
+        "id": template["id"],
+        "label": template["label"],
+        "type": template["type"],
+        "target": template["target"],
+        "progress": 0,
+        "reward": template["reward"],
+        "claimed": False,
+        "scope": template["scope"],
+    }
+
+def _get_economy_profile(user_id: int) -> dict:
+    profile = economy_profiles.setdefault(
+        user_id,
+        {
+            "coins": 0,
+            "quests": {},
+        },
+    )
+    profile.setdefault("coins", 0)
+    profile.setdefault("quests", {})
+    _ensure_quest_scope(profile, "daily")
+    _ensure_quest_scope(profile, "weekly")
+    return profile
+
+def _ensure_quest_scope(profile: dict, scope: str):
+    quests = profile.setdefault("quests", {})
+    period = _quest_period_key(scope)
+    current = quests.get(scope)
+    if not current or current.get("period") != period:
+        quests[scope] = {
+            "period": period,
+            "items": [_build_quest_entry(template) for template in _quest_templates(scope)],
+        }
+        mark_data_dirty()
+    else:
+        current.setdefault("items", [_build_quest_entry(template) for template in _quest_templates(scope)])
+
+def _track_quest_progress(user_id: int, quest_type: str, amount: int):
+    if amount <= 0:
+        return
+    profile = _get_economy_profile(user_id)
+    updated = False
+    for scope in ("daily", "weekly"):
+        _ensure_quest_scope(profile, scope)
+        items = profile["quests"][scope]["items"]
+        for quest in items:
+            if quest.get("type") != quest_type:
+                continue
+            before = int(quest.get("progress", 0))
+            target = int(quest.get("target", 0))
+            quest["progress"] = min(target, before + amount)
+            if quest["progress"] != before:
+                updated = True
+    if updated:
+        mark_data_dirty()
+
+def _format_quest_progress(quest: dict) -> str:
+    progress = int(quest.get("progress", 0))
+    target = int(quest.get("target", 0))
+    if quest.get("type") == "voice_seconds":
+        progress_txt = f"{progress // 60}m"
+        target_txt = f"{target // 60}m"
+    else:
+        progress_txt = str(progress)
+        target_txt = str(target)
+    status = "✅" if quest.get("claimed") else ("🎁" if progress >= target else "🕒")
+    return f"{status} **{quest.get('label', 'Quête')}**\n{progress_txt}/{target_txt} • {quest.get('reward', 0)} coins"
+
+def _claim_quests(user_id: int, scope: str = "all") -> tuple[int, int]:
+    profile = _get_economy_profile(user_id)
+    total_reward = 0
+    claimed_count = 0
+    scopes = ("daily", "weekly") if scope == "all" else (scope,)
+    for current_scope in scopes:
+        _ensure_quest_scope(profile, current_scope)
+        for quest in profile["quests"][current_scope]["items"]:
+            if quest.get("claimed"):
+                continue
+            if int(quest.get("progress", 0)) < int(quest.get("target", 0)):
+                continue
+            quest["claimed"] = True
+            total_reward += int(quest.get("reward", 0))
+            claimed_count += 1
+    if total_reward:
+        profile["coins"] = int(profile.get("coins", 0)) + total_reward
+        save_data()
+    return claimed_count, total_reward
+
 GACHA_RARITY_META = {
     "Commun": {"emoji": "⚪", "color": 0xBDC3C7},
     "Rare": {"emoji": "🔵", "color": 0x3498DB},
@@ -4685,6 +4815,131 @@ def _gacha_item_sort_key(item: dict):
     rarity_index = GACHA_RARITY_ORDER.index(item.get("rarity", "Commun")) if item.get("rarity", "Commun") in GACHA_RARITY_ORDER else len(GACHA_RARITY_ORDER)
     return (rarity_index, -int(item.get("count", 1)), item.get("name", ""))
 
+@tree.command(name="quests", description="🎯 Affiche tes quêtes quotidiennes et hebdomadaires")
+async def slash_quests(interaction: discord.Interaction, membre: discord.Member = None):
+    target = membre or interaction.user
+    profile = _get_economy_profile(target.id)
+
+    embed = discord.Embed(
+        title="🎯 Quêtes du serveur",
+        description=f"Progression de {target.mention}",
+        color=0xF39C12,
+        timestamp=datetime.utcnow(),
+    )
+    embed.add_field(name="🪙 Solde", value=f"{int(profile.get('coins', 0))} coins", inline=True)
+
+    daily_lines = [_format_quest_progress(quest) for quest in profile["quests"]["daily"]["items"]]
+    weekly_lines = [_format_quest_progress(quest) for quest in profile["quests"]["weekly"]["items"]]
+    embed.add_field(name="☀️ Quotidiennes", value="\n\n".join(daily_lines)[:1024], inline=False)
+    embed.add_field(name="📅 Hebdomadaires", value="\n\n".join(weekly_lines)[:1024], inline=False)
+    embed.set_footer(text="Utilise /claimquests pour récupérer tes récompenses")
+    await interaction.response.send_message(embed=embed, ephemeral=(target == interaction.user))
+
+@tree.command(name="claimquests", description="🎁 Récupère les récompenses de tes quêtes terminées")
+@app_commands.choices(portee=[
+    app_commands.Choice(name="Toutes", value="all"),
+    app_commands.Choice(name="Quotidiennes", value="daily"),
+    app_commands.Choice(name="Hebdomadaires", value="weekly"),
+])
+async def slash_claim_quests(interaction: discord.Interaction, portee: str = "all"):
+    claimed_count, total_reward = _claim_quests(interaction.user.id, portee)
+    if not claimed_count:
+        await interaction.response.send_message("📭 Aucune quête terminée à récupérer pour le moment.", ephemeral=True)
+        return
+
+    profile = _get_economy_profile(interaction.user.id)
+    embed = discord.Embed(
+        title="🎁 Récompenses récupérées",
+        description=f"Tu as validé **{claimed_count} quête(s)**.",
+        color=0x57F287,
+        timestamp=datetime.utcnow(),
+    )
+    embed.add_field(name="🪙 Gains", value=f"{total_reward} coins", inline=True)
+    embed.add_field(name="💼 Nouveau solde", value=f"{int(profile.get('coins', 0))} coins", inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@tree.command(name="balance", description="🪙 Affiche le solde de coins d'un membre")
+async def slash_balance(interaction: discord.Interaction, membre: discord.Member = None):
+    target = membre or interaction.user
+    profile = _get_economy_profile(target.id)
+    embed = discord.Embed(
+        title="🪙 Solde",
+        description=f"{target.mention} possède **{int(profile.get('coins', 0))} coins**.",
+        color=0xF1C40F,
+        timestamp=datetime.utcnow(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=(target == interaction.user))
+
+@tree.command(name="shop", description="🛒 Affiche la boutique liée au gacha")
+async def slash_shop(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🛒 Boutique du gacha",
+        description="Achète des boosts avec tes coins.",
+        color=0x8E44AD,
+        timestamp=datetime.utcnow(),
+    )
+    for item_id, item in SHOP_ITEMS.items():
+        embed.add_field(
+            name=f"{item['label']} — {item['price']} coins",
+            value=f"`{item_id}`\n{item['description']}",
+            inline=False,
+        )
+    embed.set_footer(text="Utilise /buy pour acheter un objet")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@tree.command(name="buy", description="🛍️ Achète un objet dans la boutique")
+@app_commands.choices(item=[
+    app_commands.Choice(name="Reset Marvel", value="marvel_reset"),
+    app_commands.Choice(name="Reset DC", value="dc_reset"),
+    app_commands.Choice(name="Reset total", value="all_reset"),
+    app_commands.Choice(name="Boost pity Marvel", value="marvel_pity"),
+    app_commands.Choice(name="Boost pity DC", value="dc_pity"),
+])
+async def slash_buy(interaction: discord.Interaction, item: str):
+    if item not in SHOP_ITEMS:
+        await interaction.response.send_message("❌ Objet introuvable dans la boutique.", ephemeral=True)
+        return
+
+    econ_profile = _get_economy_profile(interaction.user.id)
+    shop_item = SHOP_ITEMS[item]
+    price = int(shop_item["price"])
+    if int(econ_profile.get("coins", 0)) < price:
+        await interaction.response.send_message(
+            f"❌ Il te faut **{price} coins** pour acheter `{shop_item['label']}`.",
+            ephemeral=True,
+        )
+        return
+
+    econ_profile["coins"] = int(econ_profile.get("coins", 0)) - price
+    gacha_profile = _gacha_get_profile(interaction.user.id)
+    pity_map = gacha_profile.setdefault("pity", {})
+
+    if item == "marvel_reset":
+        _gacha_reset_user_counters(interaction.user.id, ["marvel"])
+    elif item == "dc_reset":
+        _gacha_reset_user_counters(interaction.user.id, ["dc"])
+    elif item == "all_reset":
+        _gacha_reset_user_counters(interaction.user.id, ["marvel", "dc"])
+    elif item == "marvel_pity":
+        pity_map["marvel"] = min(GACHA_PITY_THRESHOLD, int(pity_map.get("marvel", 0) or 0) + 3)
+        save_data()
+    elif item == "dc_pity":
+        pity_map["dc"] = min(GACHA_PITY_THRESHOLD, int(pity_map.get("dc", 0) or 0) + 3)
+        save_data()
+
+    if item.endswith("_reset"):
+        save_data()
+
+    embed = discord.Embed(
+        title="🛍️ Achat validé",
+        description=f"Tu as acheté **{shop_item['label']}**.",
+        color=0x57F287,
+        timestamp=datetime.utcnow(),
+    )
+    embed.add_field(name="💸 Dépensé", value=f"{price} coins", inline=True)
+    embed.add_field(name="🪙 Solde restant", value=f"{int(econ_profile.get('coins', 0))} coins", inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 @tree.command(name="gachapull", description="🎴 Invoque un personnage Marvel ou DC")
 @app_commands.choices(univers=[
     app_commands.Choice(name="Marvel", value="marvel"),
@@ -4748,6 +5003,7 @@ async def slash_gacha_pull(interaction: discord.Interaction, univers: str):
     profile["pulls"] = int(profile.get("pulls", 0)) + 1
     pity_map[univers] = 0 if pulled["rarity"] in ("Legendaire", "Mythique") else pity_before + 1
     pulls_left_after, seconds_left_after = _gacha_register_pull(profile, univers)
+    _track_quest_progress(interaction.user.id, "gacha_pulls", 1)
     save_data()
 
     rarity_meta = GACHA_RARITY_META[pulled["rarity"]]
