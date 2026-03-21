@@ -242,6 +242,7 @@ bot  = commands.Bot(
     description="🍺 Gardienne de La Taverne — https://sienna-bot.up.railway.app"
 )
 tree = bot.tree
+game_group = app_commands.Group(name="jeu", description="Toutes les commandes de jeux")
 
 # ════════════════════════════════════════════════════════════════
 #  🔧  [3] UTILITAIRES & DONNÉES
@@ -1320,9 +1321,9 @@ async def slash_reglement(interaction: discord.Interaction, salon: discord.TextC
 
 
 # ════════════════════════════════════════════════════════════════
-#  🎮  [13] MINI-JEUX — /coinflip /dice /rps /slots /guess
+#  🎮  [13] MINI-JEUX — /jeu ...
 # ════════════════════════════════════════════════════════════════
-@tree.command(name="coinflip", description="🪙 Lance une pièce")
+@game_group.command(name="coinflip", description="🪙 Lance une pièce")
 async def slash_coinflip(interaction: discord.Interaction):
     result = random.choice(["Pile 🪙", "Face 🎭"])
     embed = discord.Embed(title="🪙 Pile ou Face", description=f"Résultat : **{result}**", color=0xFFD700)
@@ -1330,7 +1331,7 @@ async def slash_coinflip(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(name="dice", description="🎲 Lance un dé")
+@game_group.command(name="dice", description="🎲 Lance un dé")
 @app_commands.describe(faces="Nombre de faces (défaut : 6)")
 async def slash_dice(interaction: discord.Interaction, faces: int = 6):
     if faces < 2:
@@ -1342,7 +1343,7 @@ async def slash_dice(interaction: discord.Interaction, faces: int = 6):
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(name="rps", description="✂️ Pierre-Papier-Ciseaux contre le bot")
+@game_group.command(name="rps", description="✂️ Pierre-Papier-Ciseaux contre le bot")
 @app_commands.describe(choix="Ton choix")
 @app_commands.choices(choix=[
     app_commands.Choice(name="Pierre 🪨",  value="pierre"),
@@ -1366,7 +1367,7 @@ async def slash_rps(interaction: discord.Interaction, choix: app_commands.Choice
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(name="slots", description="🎰 Machine à sous")
+@game_group.command(name="slots", description="🎰 Machine à sous")
 async def slash_slots(interaction: discord.Interaction):
     left = check_game_cooldown(interaction.user.id, "slots", 15)
     if left > 0:
@@ -1386,7 +1387,7 @@ async def slash_slots(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(name="guess", description="🔢 Devine un nombre entre 1 et 100 (5 essais)")
+@game_group.command(name="guess", description="🔢 Devine un nombre entre 1 et 100 (5 essais)")
 async def slash_guess(interaction: discord.Interaction):
     await interaction.response.defer()
     left = check_game_cooldown(interaction.user.id, "guess", 30)
@@ -3131,7 +3132,7 @@ class P4ViewAI(discord.ui.View):
         p4_games.pop(self.channel_id, None)
 
 
-@tree.command(name="puissance4", description="🔴🟡 Lance une partie de Puissance 4")
+@game_group.command(name="puissance4", description="🔴🟡 Lance une partie de Puissance 4")
 @app_commands.describe(
     adversaire="Un joueur à défier (laisse vide pour jouer contre le bot)",
     difficulte="Difficulté du bot (facile/moyen/difficile)"
@@ -3239,7 +3240,7 @@ def pendu_afficher(etat: dict) -> str:
         f"**Lettres essayées :** {', '.join(sorted(lettres)) or 'Aucune'}"
     )
 
-@tree.command(name="pendu", description="🪢 Lance une partie de Pendu")
+@game_group.command(name="pendu", description="🪢 Lance une partie de Pendu")
 async def slash_pendu(interaction: discord.Interaction):
     ch_id = interaction.channel_id
     if ch_id in pendu_parties:
@@ -3258,11 +3259,11 @@ async def slash_pendu(interaction: discord.Interaction):
     etat  = pendu_parties[ch_id]
     embed = discord.Embed(title="🪢 Pendu — La Taverne", description=pendu_afficher(etat), color=0x8B0000)
     embed.add_field(name="Joueur", value=interaction.user.mention, inline=True)
-    embed.add_field(name="Contrôle", value="`/pendu_lettre` ou `/pendu_stop`", inline=True)
+    embed.add_field(name="Contrôle", value="`/jeu pendu_lettre` ou `/jeu pendu_stop`", inline=True)
     embed.set_footer(text="Seul le joueur ayant lancé la partie peut proposer une lettre.")
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="pendu_lettre", description="🪢 Propose une lettre au Pendu")
+@game_group.command(name="pendu_lettre", description="🪢 Propose une lettre au Pendu")
 @app_commands.describe(lettre="Une lettre à proposer")
 async def slash_pendu_lettre(interaction: discord.Interaction, lettre: str):
     ch_id = interaction.channel_id
@@ -3295,10 +3296,10 @@ async def slash_pendu_lettre(interaction: discord.Interaction, lettre: str):
         embed = discord.Embed(title="💀 Perdu !", description=f"{PENDU_HANGMAN[6]}\nLe mot était **{etat['mot']}**. Dommage !", color=0xED4245)
     else:
         embed = discord.Embed(title="🪢 Pendu — La Taverne", description=pendu_afficher(etat), color=0x8B0000)
-        embed.set_footer(text="Tape /pendu_lettre [lettre] pour continuer !")
+        embed.set_footer(text="Tape /jeu pendu_lettre [lettre] pour continuer !")
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="pendu_stop", description="🪢 Arrête la partie de Pendu en cours")
+@game_group.command(name="pendu_stop", description="🪢 Arrête la partie de Pendu en cours")
 async def slash_pendu_stop(interaction: discord.Interaction):
     ch_id = interaction.channel_id
     if ch_id in pendu_parties:
@@ -3407,7 +3408,7 @@ class MorpionView(discord.ui.View):
         except discord.HTTPException:
             pass
 
-@tree.command(name="morpion", description="⭕❌ Lance une partie de Morpion contre un ami")
+@game_group.command(name="morpion", description="⭕❌ Lance une partie de Morpion contre un ami")
 @app_commands.describe(adversaire="Ton adversaire")
 async def slash_morpion(interaction: discord.Interaction, adversaire: discord.Member):
     if adversaire.bot or adversaire.id == interaction.user.id:
@@ -3426,7 +3427,7 @@ async def slash_morpion(interaction: discord.Interaction, adversaire: discord.Me
     await interaction.response.send_message(embed=embed, view=view)
     view.message = await interaction.original_response()
 
-@tree.command(name="morpion_stop", description="⭕❌ Arrête la partie de Morpion en cours")
+@game_group.command(name="morpion_stop", description="⭕❌ Arrête la partie de Morpion en cours")
 async def slash_morpion_stop(interaction: discord.Interaction):
     ch_id = interaction.channel_id
     partie = morpion_parties.get(ch_id)
@@ -3548,7 +3549,7 @@ class BlackjackView(discord.ui.View):
         except discord.HTTPException:
             pass
 
-@tree.command(name="blackjack", description="🃏 Lance une partie de Blackjack contre le croupier")
+@game_group.command(name="blackjack", description="🃏 Lance une partie de Blackjack contre le croupier")
 async def slash_blackjack(interaction: discord.Interaction):
     ch_id = interaction.channel_id
     if ch_id in bj_parties:
@@ -3575,7 +3576,7 @@ async def slash_blackjack(interaction: discord.Interaction):
     await interaction.response.send_message(embed=bj_build_embed(p), view=view)
     view.message = await interaction.original_response()
 
-@tree.command(name="blackjack_stop", description="🃏 Arrête la partie de Blackjack en cours")
+@game_group.command(name="blackjack_stop", description="🃏 Arrête la partie de Blackjack en cours")
 async def slash_blackjack_stop(interaction: discord.Interaction):
     ch_id = interaction.channel_id
     partie = bj_parties.get(ch_id)
@@ -3860,7 +3861,7 @@ class UnoView(discord.ui.View):
         except discord.HTTPException:
             pass
 
-@tree.command(name="uno", description="🎴 Lance une partie de UNO (2-4 joueurs)")
+@game_group.command(name="uno", description="🎴 Lance une partie de UNO (2-4 joueurs)")
 @app_commands.describe(j2="Joueur 2", j3="Joueur 3 (optionnel)", j4="Joueur 4 (optionnel)")
 async def slash_uno(interaction: discord.Interaction, j2: discord.Member, j3: discord.Member = None, j4: discord.Member = None):
     ch_id = interaction.channel_id
@@ -3901,7 +3902,7 @@ async def slash_uno(interaction: discord.Interaction, j2: discord.Member, j3: di
     p["message_id"] = message.id
     view.message = message
 
-@tree.command(name="uno_stop", description="🎴 Arrête la partie de UNO en cours")
+@game_group.command(name="uno_stop", description="🎴 Arrête la partie de UNO en cours")
 async def slash_uno_stop(interaction: discord.Interaction):
     ch_id = interaction.channel_id
     partie = uno_parties.get(ch_id)
@@ -3913,6 +3914,8 @@ async def slash_uno_stop(interaction: discord.Interaction):
         return
     uno_parties.pop(ch_id, None)
     await interaction.response.send_message("🛑 Partie de UNO arrêtée.")
+
+tree.add_command(game_group)
 
 # ════════════════════════════════════════════════════════════════
 #  📊  [17] COMPTEURS DE MEMBRES
