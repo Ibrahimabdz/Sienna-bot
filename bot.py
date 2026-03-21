@@ -205,8 +205,10 @@ announced_games: set = set()
 warns: dict[int, list] = {}  # {user_id: [{raison, mod, date}]}
 
 # ── Gacha comics / personnages
-GACHA_COOLDOWN = 3 * 3600
+GACHA_WINDOW_SECONDS = 3600
+GACHA_PULLS_PER_HOUR = 10
 GACHA_PITY_THRESHOLD = 20
+DISBOARD_BOT_ID = 302050872383242240
 
 # ════════════════════════════════════════════════════════════════
 #  🤖  [2] INTENTS & BOT
@@ -312,6 +314,105 @@ async def send_log(guild: discord.Guild, embed: discord.Embed):
             await ch.send(embed=embed)
         except Exception:
             pass
+
+def _message_interaction_user_id(message: discord.Message) -> int:
+    interaction_meta = getattr(message, "interaction_metadata", None)
+    if interaction_meta:
+        user = getattr(interaction_meta, "user", None)
+        if user:
+            return int(user.id)
+    interaction = getattr(message, "interaction", None)
+    if interaction:
+        user = getattr(interaction, "user", None)
+        if user:
+            return int(user.id)
+    return 0
+
+def _message_interaction_name(message: discord.Message) -> str:
+    interaction_meta = getattr(message, "interaction_metadata", None)
+    if interaction_meta:
+        name = getattr(interaction_meta, "name", "") or ""
+        if name:
+            return str(name).lower()
+    interaction = getattr(message, "interaction", None)
+    if interaction:
+        name = getattr(interaction, "name", "") or ""
+        if name:
+            return str(name).lower()
+    return ""
+
+def _is_confirmed_bump_message(message: discord.Message) -> bool:
+    if not message.guild or not message.author.bot:
+        return False
+    interaction_name = _message_interaction_name(message)
+
+    chunks = [message.content or ""]
+    for embed in message.embeds:
+        chunks.extend(
+            [
+                embed.title or "",
+                embed.description or "",
+                embed.footer.text if embed.footer else "",
+            ]
+        )
+    content = " ".join(chunks).lower()
+    from_bump_bot = (
+        message.author.id == DISBOARD_BOT_ID
+        or "disboard" in (message.author.name or "").lower()
+        or "bump" in interaction_name
+        or "disboard" in content
+    )
+    if not from_bump_bot:
+        return False
+    success_markers = [
+        "bump done",
+        "server bumped",
+        "bien été envoyé",
+        "a été envoyé",
+        "successfully bumped",
+        "succès",
+    ]
+    cooldown_markers = [
+        "can be bumped again",
+        "essayez à nouveau",
+        "try again",
+        "wait another",
+        "patiente",
+        "cooldown",
+    ]
+    return any(marker in content for marker in success_markers) and not any(marker in content for marker in cooldown_markers)
+
+async def _handle_bump_success(message: discord.Message) -> bool:
+    if not _is_confirmed_bump_message(message):
+        return False
+
+    user_id = _message_interaction_user_id(message)
+    if not user_id:
+        return False
+
+    _gacha_reset_user_counters(user_id)
+    member = message.guild.get_member(user_id)
+    mention = member.mention if member else f"<@{user_id}>"
+
+    confirm = discord.Embed(
+        title="🚀 Bump confirmé",
+        description=(
+            f"{mention} a bump le serveur.\n"
+            f"Les compteurs gacha **Marvel** et **DC** ont été remis à **0/{GACHA_PULLS_PER_HOUR}**."
+        ),
+        color=0x57F287,
+        timestamp=datetime.utcnow(),
+    )
+    try:
+        await message.channel.send(embed=confirm)
+    except Exception:
+        pass
+
+    log = discord.Embed(title="🚀 Reset gacha après bump", color=0x57F287, timestamp=datetime.utcnow())
+    log.add_field(name="Membre", value=f"{mention} (`{user_id}`)", inline=False)
+    log.add_field(name="Action", value=f"Quotas Marvel/DC réinitialisés à 0/{GACHA_PULLS_PER_HOUR}", inline=False)
+    await send_log(message.guild, log)
+    return True
 
 def check_game_cooldown(user_id: int, game: str, seconds: int) -> float:
     key  = f"{game}_{user_id}"
@@ -771,6 +872,11 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 # ════════════════════════════════════════════════════════════════
 @bot.event
 async def on_message(message: discord.Message):
+    if message.author.bot and message.guild:
+        await _handle_bump_success(message)
+        await bot.process_commands(message)
+        return
+
     # ── Anti-spam ─────────────────────────────────────────────
     if antispam_enabled and not message.author.bot and message.guild:
         member = message.guild.get_member(message.author.id)
@@ -4414,13 +4520,13 @@ def _gacha_get_profile(user_id: int) -> dict:
         user_id,
         {
             "pulls": 0,
-            "last_pull_at": {},
+            "pull_windows": {},
             "pity": {},
             "items": {},
         },
     )
     profile.setdefault("pulls", 0)
-    profile.setdefault("last_pull_at", {})
+    profile.setdefault("pull_windows", {})
     profile.setdefault("pity", {})
     profile.setdefault("items", {})
     return profile
@@ -4504,10 +4610,38 @@ def _gacha_roll_rarity(available_rarities: list[str], pity: int) -> str:
     selected = random.choices(population, weights=[weights[rarity] for rarity in population], k=1)[0]
     return selected
 
-def _gacha_seconds_left(profile: dict, universe_slug: str) -> int:
-    last_pull = float(profile.get("last_pull_at", {}).get(universe_slug, 0) or 0)
-    remaining = int(GACHA_COOLDOWN - (datetime.utcnow().timestamp() - last_pull))
-    return max(0, remaining)
+def _gacha_get_window(profile: dict, universe_slug: str) -> dict:
+    windows = profile.setdefault("pull_windows", {})
+    window = windows.setdefault(universe_slug, {"start": 0.0, "count": 0})
+    start_ts = float(window.get("start", 0) or 0)
+    now_ts = datetime.utcnow().timestamp()
+    if not start_ts or now_ts - start_ts >= GACHA_WINDOW_SECONDS:
+        window["start"] = now_ts
+        window["count"] = 0
+    return window
+
+def _gacha_window_status(profile: dict, universe_slug: str) -> tuple[int, int]:
+    window = _gacha_get_window(profile, universe_slug)
+    count = int(window.get("count", 0) or 0)
+    remaining = max(0, GACHA_PULLS_PER_HOUR - count)
+    seconds_left = max(0, int(GACHA_WINDOW_SECONDS - (datetime.utcnow().timestamp() - float(window.get("start", 0) or 0))))
+    return remaining, seconds_left
+
+def _gacha_register_pull(profile: dict, universe_slug: str) -> tuple[int, int]:
+    window = _gacha_get_window(profile, universe_slug)
+    window["count"] = int(window.get("count", 0) or 0) + 1
+    remaining = max(0, GACHA_PULLS_PER_HOUR - int(window["count"]))
+    seconds_left = max(0, int(GACHA_WINDOW_SECONDS - (datetime.utcnow().timestamp() - float(window.get("start", 0) or 0))))
+    return remaining, seconds_left
+
+def _gacha_reset_user_counters(user_id: int, universes: list[str] | None = None):
+    profile = _gacha_get_profile(user_id)
+    windows = profile.setdefault("pull_windows", {})
+    now_ts = datetime.utcnow().timestamp()
+    targets = universes or ["marvel", "dc"]
+    for universe_slug in targets:
+        windows[universe_slug] = {"start": now_ts, "count": 0}
+    save_data()
 
 def _gacha_item_sort_key(item: dict):
     rarity_index = GACHA_RARITY_ORDER.index(item.get("rarity", "Commun")) if item.get("rarity", "Commun") in GACHA_RARITY_ORDER else len(GACHA_RARITY_ORDER)
@@ -4527,11 +4661,12 @@ async def slash_gacha_pull(interaction: discord.Interaction, univers: str):
     publisher_id = 31 if univers == "marvel" else 10
     meta = _publisher_meta(publisher_id)
     profile = _gacha_get_profile(interaction.user.id)
-    time_left = _gacha_seconds_left(profile, univers)
-    if time_left > 0:
-        minutes, seconds = divmod(time_left, 60)
+    pulls_left, seconds_left = _gacha_window_status(profile, univers)
+    if pulls_left <= 0:
+        minutes, seconds = divmod(seconds_left, 60)
         await interaction.followup.send(
-            f"⏳ Ton prochain pull {meta['name']} sera disponible dans **{minutes}m {seconds:02d}s**.",
+            f"⏳ Tu as déjà utilisé tes **{GACHA_PULLS_PER_HOUR} pulls** {meta['name']} pour cette heure.\n"
+            f"Prochaine recharge dans **{minutes}m {seconds:02d}s**.",
             ephemeral=True,
         )
         return
@@ -4573,8 +4708,8 @@ async def slash_gacha_pull(interaction: discord.Interaction, univers: str):
         items[key] = stored
 
     profile["pulls"] = int(profile.get("pulls", 0)) + 1
-    profile.setdefault("last_pull_at", {})[univers] = datetime.utcnow().timestamp()
     pity_map[univers] = 0 if pulled["rarity"] in ("Legendaire", "Mythique") else pity_before + 1
+    pulls_left_after, seconds_left_after = _gacha_register_pull(profile, univers)
     save_data()
 
     rarity_meta = GACHA_RARITY_META[pulled["rarity"]]
@@ -4593,9 +4728,15 @@ async def slash_gacha_pull(interaction: discord.Interaction, univers: str):
     embed.add_field(name="📖 Apparitions", value=str(pulled.get("appearances", 0)), inline=True)
     embed.add_field(name="🗂️ Exemplaires", value=str(duplicate_count), inline=True)
     embed.add_field(name="🎯 Pity", value=f"{pity_map[univers]}/{GACHA_PITY_THRESHOLD}", inline=True)
+    embed.add_field(name="🎟️ Pulls restants", value=f"{pulls_left_after}/{GACHA_PULLS_PER_HOUR}", inline=True)
     if pulled.get("image"):
         embed.set_image(url=pulled["image"])
-    embed.set_footer(text=f"Gacha {meta['name']} • prochaines invocations dans {GACHA_COOLDOWN // 3600}h")
+    if pulls_left_after == 0:
+        minutes, seconds = divmod(seconds_left_after, 60)
+        footer = f"Gacha {meta['name']} • quota atteint, reset dans {minutes}m {seconds:02d}s"
+    else:
+        footer = f"Gacha {meta['name']} • jusqu'à {GACHA_PULLS_PER_HOUR} pulls par heure"
+    embed.set_footer(text=footer)
     await interaction.followup.send(embed=embed)
 
 @tree.command(name="gachacollection", description="📚 Affiche la collection gacha Marvel/DC")
@@ -4647,6 +4788,10 @@ async def slash_gacha_collection(
     embed.add_field(name="🧾 Cartes uniques", value=str(len(items)), inline=True)
     embed.add_field(name="📦 Copies totales", value=str(total_copies), inline=True)
     embed.add_field(name="🎰 Pulls", value=str(profile.get("pulls", 0)), inline=True)
+    marvel_left, _ = _gacha_window_status(profile, "marvel")
+    dc_left, _ = _gacha_window_status(profile, "dc")
+    embed.add_field(name="🎟️ Marvel", value=f"{marvel_left}/{GACHA_PULLS_PER_HOUR}", inline=True)
+    embed.add_field(name="🎟️ DC", value=f"{dc_left}/{GACHA_PULLS_PER_HOUR}", inline=True)
 
     rarity_summary = []
     for rarity in GACHA_RARITY_ORDER:
