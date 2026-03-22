@@ -485,9 +485,10 @@ def _akinator_theme_label(theme: str) -> str:
     return {"c": "Personnage", "a": "Animal", "o": "Objet"}.get(theme, "Personnage")
 
 
-def _make_akinator_client() -> AsyncAkinator:
+def _make_akinator_client(browser_platform: str | None = None) -> AsyncAkinator:
+    browser_platform = browser_platform or ("windows" if os.name == "nt" else "linux")
     session = AsyncCloudScraper(
-        browser={"browser": "chrome", "platform": "windows", "desktop": True}
+        browser={"browser": "chrome", "platform": browser_platform, "desktop": True}
     )
     headers = {
         "User-Agent": (
@@ -504,6 +505,20 @@ def _make_akinator_client() -> AsyncAkinator:
     if scraper:
         scraper.headers.update(headers)
     return AsyncAkinator(session=session)
+
+
+def _reset_akinator_state(aki: AsyncAkinator):
+    aki.progression = 0
+    aki.step = 0
+    aki.akitude = "defi.png"
+    aki.finished = False
+    aki.win = False
+    aki.step_last_proposition = ""
+    aki.id_proposition = None
+    aki.name_proposition = None
+    aki.description_proposition = None
+    aki.flag_photo = None
+    aki.photo = None
 
 
 async def _akinator_post(aki: AsyncAkinator, endpoint: str, data: dict, *, allow_redirects: bool = False):
@@ -526,31 +541,73 @@ def _extract_akinator_value(patterns: list[str], text: str) -> str:
 
 async def _start_akinator_game(aki: AsyncAkinator, theme: str, *, child_mode: bool = False):
     errors: list[str] = []
-    for language in ("fr", "en"):
-        for attempt in range(2):
-            try:
-                if attempt > 0 or language != "fr":
-                    fresh_client = _make_akinator_client()
+
+    async def _start_native(target: AsyncAkinator, language: str):
+        await asyncio.wait_for(
+            target.start_game(language=language, child_mode=child_mode, theme=theme),
+            timeout=20,
+        )
+        _reset_akinator_state(target)
+
+    async def _start_legacy(target: AsyncAkinator, language: str):
+        target.theme = theme
+        target.language = language
+        target.child_mode = child_mode
+        headers = {
+            "Origin": f"https://{language}.akinator.com",
+            "Referer": f"https://{language}.akinator.com/",
+            "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
+        scraper = getattr(target.session, "scraper", None)
+        if scraper:
+            scraper.headers.update(headers)
+            await asyncio.to_thread(
+                scraper.get,
+                f"https://{language}.akinator.com/",
+                headers=headers,
+                timeout=20,
+                allow_redirects=True,
+            )
+        response = await target.session.post(
+            f"https://{language}.akinator.com/game",
+            data={"sid": THEME_IDS[theme], "cm": str(child_mode).lower()},
+            headers=headers,
+            timeout=20,
+        )
+        response.raise_for_status()
+        text = response.text
+
+        target.session_id = _extract_akinator_value([r"#session'\)\.val\('(.+?)'\)"], text)
+        target.signature = _extract_akinator_value([r"#signature'\)\.val\('(.+?)'\)"], text)
+        target.identifiant = _extract_akinator_value([r"#identifiant'\)\.val\('(.+?)'\)"], text)
+        target.question = _extract_akinator_value(
+            [
+                r'<p class="question-text" id="question-label">(.+?)</p>',
+                r'<div class="bubble-body">\s*<p[^>]*id="question-label"[^>]*>(.+?)</p>',
+            ],
+            text,
+        )
+        if not all([target.session_id, target.signature, target.identifiant, target.question]):
+            raise RuntimeError("Réponse de démarrage incomplète")
+        target.proposition = _extract_akinator_value([r'<p id="p-sub-bubble">(.+?)</p>'], text)
+        _reset_akinator_state(target)
+
+    platform_order = [("windows" if os.name == "nt" else "linux")]
+    alternate_platform = "linux" if platform_order[0] == "windows" else "windows"
+    platform_order.append(alternate_platform)
+
+    for browser_platform in platform_order:
+        for language in ("fr", "en"):
+            for strategy_name, strategy in (("native", _start_native), ("legacy", _start_legacy)):
+                try:
+                    fresh_client = _make_akinator_client(browser_platform)
                     aki.session = fresh_client.session
-                await asyncio.wait_for(
-                    aki.start_game(language=language, child_mode=child_mode, theme=theme),
-                    timeout=20,
-                )
-                aki.progression = 0
-                aki.step = 0
-                aki.akitude = "defi.png"
-                aki.finished = False
-                aki.win = False
-                aki.step_last_proposition = ""
-                aki.id_proposition = None
-                aki.name_proposition = None
-                aki.description_proposition = None
-                aki.flag_photo = None
-                aki.photo = None
-                return
-            except Exception as exc:
-                errors.append(f"{language}#{attempt + 1}:{exc!r}")
-                await asyncio.sleep(0.6)
+                    await strategy(aki, language)
+                    print(f"ℹ️ Akinator startup OK via {strategy_name} ({browser_platform}/{language})")
+                    return
+                except Exception as exc:
+                    errors.append(f"{strategy_name}:{browser_platform}:{language}:{exc!r}")
+                    await asyncio.sleep(0.5)
     raise RuntimeError(" ; ".join(errors[-4:]) or "Échec du démarrage Akinator")
 
 
