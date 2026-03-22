@@ -5842,6 +5842,29 @@ async def slash_balance(interaction: discord.Interaction, membre: discord.Member
     )
     await interaction.response.send_message(embed=embed, ephemeral=(target == interaction.user))
 
+
+@tree.command(name="givecoins", description="[Admin] Donne des coins à un membre")
+@app_commands.describe(membre="Membre à créditer", montant="Nombre de coins à ajouter")
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_givecoins(interaction: discord.Interaction, membre: discord.Member, montant: int):
+    if montant <= 0:
+        await interaction.response.send_message("❌ Le montant doit être supérieur à 0.", ephemeral=True)
+        return
+
+    profile = _get_economy_profile(membre.id)
+    profile["coins"] = int(profile.get("coins", 0)) + montant
+    save_data()
+
+    embed = discord.Embed(
+        title="🪙 Coins ajoutés",
+        description=f"{membre.mention} a reçu **{montant} coins**.",
+        color=0x57F287,
+        timestamp=datetime.utcnow(),
+    )
+    embed.add_field(name="💼 Nouveau solde", value=f"{int(profile.get('coins', 0))} coins", inline=True)
+    embed.add_field(name="👤 Donné par", value=interaction.user.mention, inline=True)
+    await interaction.response.send_message(embed=embed)
+
 @tree.command(name="shop", description="🛒 Affiche la boutique du serveur")
 async def slash_shop(interaction: discord.Interaction):
     embed = discord.Embed(
