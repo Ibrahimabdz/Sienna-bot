@@ -126,6 +126,22 @@ def build_welcome_dm_embed(member: discord.Member, *, preview: bool = False) -> 
     embed.set_footer(text=footer, icon_url=guild.icon.url if guild.icon else None)
     return embed
 
+
+async def send_welcome_dm(member: discord.Member, *, preview: bool = False) -> bool:
+    embed = build_welcome_dm_embed(member, preview=preview)
+    if WELCOME_GIF_ENABLED:
+        try:
+            buf = await make_welcome_gif(member, is_welcome=not preview)
+            file = discord.File(buf, filename="bienvenue.gif")
+            embed.set_image(url="attachment://bienvenue.gif")
+            await member.send(embed=embed, file=file)
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            return False
+        except Exception:
+            pass
+    return await send_dm(member, embed)
+
 def load_data():
     """Charge toutes les données depuis data.json au démarrage"""
     global xp_data, warns, reaction_roles
@@ -656,7 +672,7 @@ async def on_member_join(member: discord.Member):
             except Exception:
                 pass
 
-    dm_sent = await send_dm(member, build_welcome_dm_embed(member))
+    dm_sent = await send_welcome_dm(member)
     log.add_field(name="📩 MP bienvenue", value="✅ Envoyé" if dm_sent else "❌ DMs fermés", inline=True)
     log.set_footer(text=f"ID : {member.id}")
     await send_log(guild, log)
@@ -1643,7 +1659,7 @@ async def slash_previewbienvenue(interaction: discord.Interaction, membre: disco
         )
         return
 
-    dm_sent = await send_dm(target, build_welcome_dm_embed(target, preview=True))
+    dm_sent = await send_welcome_dm(target, preview=True)
     if not dm_sent:
         await interaction.followup.send(
             f"❌ Impossible d'envoyer le MP à {target.mention} (DMs fermés).",
