@@ -5,6 +5,7 @@ import aiohttp
 import os
 import random
 import asyncio
+import re
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import json
@@ -30,6 +31,15 @@ try:
 except ImportError:
     LEVELUP_GIF_ENABLED = False
     print("⚠️  levelup_card.py introuvable — GIF level-up désactivé")
+
+try:
+    from akinator.async_client import AsyncAkinator, THEME_IDS
+    AKINATOR_ENABLED = True
+except ImportError:
+    AsyncAkinator = None
+    THEME_IDS = {}
+    AKINATOR_ENABLED = False
+    print("⚠️  akinator non installé — /jeu akinator désactivé")
 
 load_dotenv()
 
@@ -274,7 +284,29 @@ SHOP_ITEMS = {
     "all_reset": {"label": "Reset total", "price": 450, "description": "Remet Marvel et DC à 0/10"},
     "marvel_pity": {"label": "Boost pity Marvel", "price": 300, "description": "Ajoute +3 pity sur Marvel"},
     "dc_pity": {"label": "Boost pity DC", "price": 300, "description": "Ajoute +3 pity sur DC"},
+    "level_up": {"label": "Niveau +1", "price": 900, "description": "Achète un niveau supplémentaire"},
+    "custom_role": {"label": "Rôle personnalisable", "price": 3500, "description": "Débloque un rôle perso modifiable avec /roleperso"},
 }
+DISABLED_SLASH_COMMANDS = [
+    "loupgarou",
+    "lgvote",
+    "lgnuit",
+    "lgjour",
+    "lgvoir",
+    "lgsauver",
+    "lgpotion",
+    "lglier",
+    "lgchasser",
+    "lgstatus",
+    "lgarreter",
+]
+AKINATOR_GUESS_THRESHOLD = 80
+AKINATOR_THEMES = {
+    "personnage": "c",
+    "animal": "a",
+    "objet": "o",
+}
+akinator_sessions: dict[int, dict] = {}
 
 # ════════════════════════════════════════════════════════════════
 #  🤖  [2] INTENTS & BOT
@@ -318,6 +350,475 @@ def get_user_data(user_id: int) -> dict:
     d.setdefault("top_channel", {})
     d.setdefault("top_voice", {})
     return d
+
+
+async def _grant_level_role(member: discord.Member, level: int, *, reason: str):
+    role_id = LEVEL_ROLES.get(level)
+    if not role_id:
+        return
+    role = member.guild.get_role(role_id)
+    if not role:
+        return
+    try:
+        await member.add_roles(role, reason=reason)
+    except discord.Forbidden:
+        pass
+
+
+async def _apply_purchased_levels(member: discord.Member, levels: int) -> tuple[int, int]:
+    data = get_user_data(member.id)
+    old_level = int(data.get("level", 0))
+    data["level"] = old_level + max(1, levels)
+    mark_data_dirty()
+    for level in range(old_level + 1, data["level"] + 1):
+        await _grant_level_role(member, level, reason=f"Niveau acheté ({level})")
+    return old_level, data["level"]
+
+
+def _parse_hex_color(value: str) -> discord.Color | None:
+    raw = value.strip().lower().replace("#", "").replace("0x", "")
+    if not re.fullmatch(r"[0-9a-f]{6}", raw):
+        return None
+    return discord.Color(int(raw, 16))
+
+
+def _get_bot_member(guild: discord.Guild) -> discord.Member | None:
+    if guild.me:
+        return guild.me
+    if bot.user:
+        return guild.get_member(bot.user.id)
+    return None
+
+
+def _ensure_custom_role_state(profile: dict, guild_id: int) -> dict:
+    custom_roles = profile.setdefault("custom_roles", {})
+    state = custom_roles.setdefault(str(guild_id), {"owned": False, "role_id": 0})
+    state.setdefault("owned", False)
+    state.setdefault("role_id", 0)
+    return state
+
+
+async def _create_or_update_custom_role(member: discord.Member, role_name: str, color: discord.Color) -> tuple[discord.Role, bool]:
+    guild = member.guild
+    bot_member = _get_bot_member(guild)
+    if not bot_member or not bot_member.guild_permissions.manage_roles:
+        raise PermissionError("Je n'ai pas la permission **Gérer les rôles**.")
+
+    profile = _get_economy_profile(member.id)
+    state = _ensure_custom_role_state(profile, guild.id)
+    if not state.get("owned"):
+        raise ValueError("Tu dois d'abord acheter le rôle personnalisable dans `/shop`.")
+
+    role = guild.get_role(int(state.get("role_id", 0) or 0))
+    created = False
+
+    if role is None:
+        role = await guild.create_role(
+            name=role_name,
+            colour=color,
+            hoist=False,
+            mentionable=False,
+            reason=f"Rôle personnalisé créé pour {member}",
+        )
+        state["role_id"] = role.id
+        created = True
+    else:
+        await role.edit(
+            name=role_name,
+            colour=color,
+            reason=f"Rôle personnalisé modifié pour {member}",
+        )
+
+    target_position = max(1, bot_member.top_role.position - 1)
+    try:
+        if role.position != target_position:
+            await role.edit(position=target_position, reason="Placement du rôle personnalisé")
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    try:
+        if role not in member.roles:
+            await member.add_roles(role, reason="Attribution du rôle personnalisé")
+    except discord.Forbidden as exc:
+        raise PermissionError("Je ne peux pas attribuer ce rôle avec ma hiérarchie actuelle.") from exc
+
+    save_data()
+    return role, created
+
+
+def _close_akinator_session(user_id: int):
+    akinator_sessions.pop(user_id, None)
+
+
+async def _cleanup_akinator_session(user_id: int):
+    session = akinator_sessions.pop(user_id, None)
+    if not session:
+        return
+    aki = session.get("aki")
+    close_method = getattr(getattr(aki, "session", None), "close", None)
+    if not close_method:
+        return
+    try:
+        maybe_coro = close_method()
+        if asyncio.iscoroutine(maybe_coro):
+            await maybe_coro
+    except Exception:
+        pass
+
+
+def _akinator_theme_label(theme: str) -> str:
+    return {"c": "Personnage", "a": "Animal", "o": "Objet"}.get(theme, "Personnage")
+
+
+async def _akinator_post(aki: AsyncAkinator, endpoint: str, data: dict, *, allow_redirects: bool = False):
+    response = await aki.session.post(
+        f"https://{aki.language}.akinator.com/{endpoint}",
+        data=data,
+        allow_redirects=allow_redirects,
+    )
+    response.raise_for_status()
+    return response
+
+
+def _akinator_apply_payload(aki: AsyncAkinator, payload: dict):
+    aki.completion = payload.get("completion", getattr(aki, "completion", None))
+    if aki.completion == "KO - TIMEOUT":
+        raise RuntimeError("La session Akinator a expiré. Relance `/jeu akinator`.")
+
+    if "id_proposition" in payload:
+        aki.win = True
+        aki.finished = False
+        aki.id_proposition = payload.get("id_proposition")
+        aki.name_proposition = payload.get("name_proposition", "Inconnu")
+        aki.description_proposition = payload.get("description_proposition", "")
+        aki.pseudo = payload.get("pseudo")
+        aki.flag_photo = payload.get("flag_photo")
+        aki.photo = payload.get("photo")
+        if "step" in payload:
+            aki.step = int(float(payload["step"]))
+        if "progression" in payload:
+            aki.progression = float(payload["progression"])
+        return
+
+    aki.win = False
+    aki.finished = False
+    if "step" in payload:
+        aki.step = int(float(payload["step"]))
+    if "progression" in payload:
+        aki.progression = float(payload["progression"])
+    if "question" in payload:
+        aki.question = payload["question"]
+    if "akitude" in payload:
+        aki.akitude = payload["akitude"]
+
+
+async def _akinator_answer(aki: AsyncAkinator, answer: str):
+    if aki.win:
+        if answer == "yes":
+            response = await _akinator_post(
+                aki,
+                "choice",
+                {
+                    "step": aki.step,
+                    "sid": THEME_IDS[aki.theme],
+                    "session": aki.session_id,
+                    "signature": aki.signature,
+                    "identifiant": aki.identifiant,
+                    "pid": aki.id_proposition,
+                    "charac_name": aki.name_proposition,
+                    "charac_description": aki.description_proposition,
+                    "pflag_photo": aki.flag_photo or "",
+                },
+                allow_redirects=True,
+            )
+            aki.finished = True
+            aki.win = True
+            aki.progression = 100
+            return response
+        if answer == "no":
+            aki.win = False
+            aki.id_proposition = ""
+            response = await _akinator_post(
+                aki,
+                "exclude",
+                {
+                    "step": int(aki.step) + 1,
+                    "progression": aki.progression,
+                    "sid": THEME_IDS[aki.theme],
+                    "cm": str(aki.child_mode).lower(),
+                    "session": aki.session_id,
+                    "signature": aki.signature,
+                    "forward_answer": 1,
+                },
+            )
+            payload = response.json()
+            _akinator_apply_payload(aki, payload)
+            return payload
+        raise ValueError("Après une proposition, réponds seulement par oui ou non.")
+
+    answer_map = {
+        "yes": 0,
+        "no": 1,
+        "idk": 2,
+        "probably": 3,
+        "probably_not": 4,
+    }
+    if answer not in answer_map:
+        raise ValueError("Réponse Akinator invalide.")
+
+    response = await _akinator_post(
+        aki,
+        "answer",
+        {
+            "step": aki.step,
+            "progression": aki.progression,
+            "sid": THEME_IDS[aki.theme],
+            "cm": str(aki.child_mode).lower(),
+            "answer": answer_map[answer],
+            "step_last_proposition": getattr(aki, "step_last_proposition", ""),
+            "session": aki.session_id,
+            "signature": aki.signature,
+        },
+    )
+    payload = response.json()
+    _akinator_apply_payload(aki, payload)
+    return payload
+
+
+async def _akinator_back(aki: AsyncAkinator):
+    if int(getattr(aki, "step", 0) or 0) <= 0:
+        raise ValueError("Tu es déjà à la première question.")
+    aki.win = False
+    response = await _akinator_post(
+        aki,
+        "cancel_answer",
+        {
+            "step": aki.step,
+            "progression": aki.progression,
+            "sid": THEME_IDS[aki.theme],
+            "cm": str(aki.child_mode).lower(),
+            "session": aki.session_id,
+            "signature": aki.signature,
+        },
+    )
+    payload = response.json()
+    _akinator_apply_payload(aki, payload)
+    return payload
+
+
+def _akinator_question_embed(user: discord.abc.User, aki: AsyncAkinator) -> discord.Embed:
+    embed = discord.Embed(
+        title="🧠 Akinator",
+        description=aki.question or "Question indisponible.",
+        color=0xF1C40F,
+        timestamp=datetime.utcnow(),
+    )
+    embed.add_field(name="🎯 Thème", value=_akinator_theme_label(aki.theme), inline=True)
+    embed.add_field(name="📈 Progression", value=f"{float(getattr(aki, 'progression', 0) or 0):.1f}%", inline=True)
+    embed.add_field(name="🔢 Question", value=str(int(getattr(aki, 'step', 0) or 0) + 1), inline=True)
+    embed.set_footer(text=f"Partie de {user.display_name}")
+    return embed
+
+
+def _akinator_guess_embed(user: discord.abc.User, aki: AsyncAkinator) -> discord.Embed:
+    embed = discord.Embed(
+        title="🤔 Je pense avoir trouvé",
+        description=f"Je pense à **{getattr(aki, 'name_proposition', 'Inconnu')}**.",
+        color=0x57F287,
+        timestamp=datetime.utcnow(),
+    )
+    description = getattr(aki, "description_proposition", "") or "Pas de description disponible."
+    embed.add_field(name="📚 Description", value=description[:1024], inline=False)
+    embed.add_field(name="❓ C'est bien ça ?", value="Réponds avec les boutons ci-dessous.", inline=False)
+    photo = getattr(aki, "photo", None)
+    if photo:
+        embed.set_thumbnail(url=photo)
+    embed.set_footer(text=f"Partie de {user.display_name}")
+    return embed
+
+
+def _akinator_finished_embed(user: discord.abc.User, aki: AsyncAkinator) -> discord.Embed:
+    embed = discord.Embed(
+        title="✅ Akinator terminé",
+        description=f"J'avais bien trouvé **{getattr(aki, 'name_proposition', 'Inconnu')}**.",
+        color=0x57F287,
+        timestamp=datetime.utcnow(),
+    )
+    description = getattr(aki, "description_proposition", "") or "Pas de description disponible."
+    embed.add_field(name="📚 Résultat", value=description[:1024], inline=False)
+    photo = getattr(aki, "photo", None)
+    if photo:
+        embed.set_thumbnail(url=photo)
+    embed.set_footer(text=f"Partie de {user.display_name}")
+    return embed
+
+
+class AkinatorQuestionView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=240)
+        self.user_id = user_id
+        self.message: discord.Message | None = None
+
+    async def _interaction_check(self, interaction: discord.Interaction) -> bool:
+        session = akinator_sessions.get(self.user_id)
+        if not session:
+            await interaction.response.send_message("❌ Cette partie Akinator n'est plus active.", ephemeral=True)
+            return False
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ Cette partie ne t'appartient pas.", ephemeral=True)
+            return False
+        return True
+
+    async def _handle_answer(self, interaction: discord.Interaction, answer: str):
+        if not await self._interaction_check(interaction):
+            return
+        session = akinator_sessions[self.user_id]
+        aki = session["aki"]
+        try:
+            await _akinator_answer(aki, answer)
+        except Exception as exc:
+            await _cleanup_akinator_session(self.user_id)
+            await interaction.response.edit_message(
+                content=f"❌ Akinator a rencontré une erreur: `{exc}`",
+                embed=None,
+                view=None,
+            )
+            return
+
+        if getattr(aki, "finished", False):
+            await _cleanup_akinator_session(self.user_id)
+            await interaction.response.edit_message(embed=_akinator_finished_embed(interaction.user, aki), view=None)
+            return
+
+        if getattr(aki, "win", False) or float(getattr(aki, "progression", 0) or 0) >= AKINATOR_GUESS_THRESHOLD:
+            guess_view = AkinatorGuessView(self.user_id)
+            guess_view.message = interaction.message
+            await interaction.response.edit_message(embed=_akinator_guess_embed(interaction.user, aki), view=guess_view)
+            return
+
+        new_view = AkinatorQuestionView(self.user_id)
+        new_view.message = interaction.message
+        await interaction.response.edit_message(embed=_akinator_question_embed(interaction.user, aki), view=new_view)
+
+    async def on_timeout(self):
+        await _cleanup_akinator_session(self.user_id)
+        if not self.message:
+            return
+        try:
+            await self.message.edit(content="⌛ La partie Akinator a expiré.", embed=None, view=None)
+        except discord.HTTPException:
+            pass
+
+    @discord.ui.button(label="Oui", style=discord.ButtonStyle.success, row=0)
+    async def yes(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._handle_answer(interaction, "yes")
+
+    @discord.ui.button(label="Non", style=discord.ButtonStyle.danger, row=0)
+    async def no(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._handle_answer(interaction, "no")
+
+    @discord.ui.button(label="Je sais pas", style=discord.ButtonStyle.secondary, row=0)
+    async def idk(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._handle_answer(interaction, "idk")
+
+    @discord.ui.button(label="Probablement", style=discord.ButtonStyle.primary, row=1)
+    async def probably(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._handle_answer(interaction, "probably")
+
+    @discord.ui.button(label="Probablement pas", style=discord.ButtonStyle.primary, row=1)
+    async def probably_not(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await self._handle_answer(interaction, "probably_not")
+
+    @discord.ui.button(label="Retour", style=discord.ButtonStyle.secondary, row=2)
+    async def back(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not await self._interaction_check(interaction):
+            return
+        session = akinator_sessions[self.user_id]
+        aki = session["aki"]
+        try:
+            await _akinator_back(aki)
+        except ValueError as exc:
+            await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+            return
+        except Exception as exc:
+            await _cleanup_akinator_session(self.user_id)
+            await interaction.response.edit_message(content=f"❌ Akinator a rencontré une erreur: `{exc}`", embed=None, view=None)
+            return
+        new_view = AkinatorQuestionView(self.user_id)
+        new_view.message = interaction.message
+        await interaction.response.edit_message(embed=_akinator_question_embed(interaction.user, aki), view=new_view)
+
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, row=2)
+    async def stop(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not await self._interaction_check(interaction):
+            return
+        await _cleanup_akinator_session(self.user_id)
+        await interaction.response.edit_message(content="🛑 Partie Akinator arrêtée.", embed=None, view=None)
+
+
+class AkinatorGuessView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=180)
+        self.user_id = user_id
+        self.message: discord.Message | None = None
+
+    async def _interaction_check(self, interaction: discord.Interaction) -> bool:
+        session = akinator_sessions.get(self.user_id)
+        if not session:
+            await interaction.response.send_message("❌ Cette partie Akinator n'est plus active.", ephemeral=True)
+            return False
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ Cette partie ne t'appartient pas.", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        await _cleanup_akinator_session(self.user_id)
+        if not self.message:
+            return
+        try:
+            await self.message.edit(content="⌛ La partie Akinator a expiré.", embed=None, view=None)
+        except discord.HTTPException:
+            pass
+
+    @discord.ui.button(label="Oui, c'est ça", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not await self._interaction_check(interaction):
+            return
+        session = akinator_sessions[self.user_id]
+        aki = session["aki"]
+        try:
+            await _akinator_answer(aki, "yes")
+        except Exception as exc:
+            await _cleanup_akinator_session(self.user_id)
+            await interaction.response.edit_message(content=f"❌ Akinator a rencontré une erreur: `{exc}`", embed=None, view=None)
+            return
+        await _cleanup_akinator_session(self.user_id)
+        await interaction.response.edit_message(embed=_akinator_finished_embed(interaction.user, aki), view=None)
+
+    @discord.ui.button(label="Non, continue", style=discord.ButtonStyle.primary)
+    async def deny(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not await self._interaction_check(interaction):
+            return
+        session = akinator_sessions[self.user_id]
+        aki = session["aki"]
+        try:
+            await _akinator_answer(aki, "no")
+        except Exception as exc:
+            await _cleanup_akinator_session(self.user_id)
+            await interaction.response.edit_message(content=f"❌ Akinator a rencontré une erreur: `{exc}`", embed=None, view=None)
+            return
+
+        new_view = AkinatorQuestionView(self.user_id)
+        new_view.message = interaction.message
+        await interaction.response.edit_message(embed=_akinator_question_embed(interaction.user, aki), view=new_view)
+
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger)
+    async def stop(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not await self._interaction_check(interaction):
+            return
+        await _cleanup_akinator_session(self.user_id)
+        await interaction.response.edit_message(content="🛑 Partie Akinator arrêtée.", embed=None, view=None)
 
 def get_stats_for_days(user_id: int, days: int) -> dict:
     """Calcule msgs et heures vocales sur N derniers jours."""
@@ -541,6 +1042,8 @@ async def save_loop():
 @bot.event
 async def on_ready():
     load_data()
+    for command_name in DISABLED_SLASH_COMMANDS:
+        tree.remove_command(command_name)
 
     # ── Enregistrer les Views persistantes (boutons qui survivent au redémarrage) ──
     bot.add_view(TicketSelectView())   # Panel tickets
@@ -1144,13 +1647,7 @@ async def on_message(message: discord.Message):
             await message.channel.send(embed=embed, delete_after=20)
 
         # ── Rôle de niveau ──────────────────────────────
-        if lvl in LEVEL_ROLES:
-            role = message.guild.get_role(LEVEL_ROLES[lvl])
-            if role:
-                try:
-                    await message.author.add_roles(role, reason=f"Niveau {lvl} atteint")
-                except discord.Forbidden:
-                    pass
+        await _grant_level_role(message.author, lvl, reason=f"Niveau {lvl} atteint")
     await bot.process_commands(message)
 
 # ════════════════════════════════════════════════════════════════
@@ -1432,6 +1929,46 @@ async def slash_slots(interaction: discord.Interaction):
     embed = discord.Embed(title="🎰 Machine à sous", description=f"**{line}**\n\n{result}", color=color)
     embed.set_footer(text=f"Joué par {interaction.user.display_name}")
     await interaction.response.send_message(embed=embed)
+
+
+@game_group.command(name="akinator", description="🧠 Lance une partie d'Akinator")
+@app_commands.choices(theme=[
+    app_commands.Choice(name="Personnage", value="personnage"),
+    app_commands.Choice(name="Animal", value="animal"),
+    app_commands.Choice(name="Objet", value="objet"),
+])
+async def slash_akinator(interaction: discord.Interaction, theme: str = "personnage"):
+    if not AKINATOR_ENABLED:
+        await interaction.response.send_message(
+            "❌ Akinator n'est pas disponible sur cette instance. Ajoute la dépendance `akinator` puis redémarre le bot.",
+            ephemeral=True,
+        )
+        return
+
+    existing = akinator_sessions.get(interaction.user.id)
+    if existing:
+        await _cleanup_akinator_session(interaction.user.id)
+
+    await interaction.response.defer()
+    aki = AsyncAkinator()
+    try:
+        await aki.start_game(language="fr", theme=AKINATOR_THEMES.get(theme, "c"))
+    except Exception:
+        try:
+            await aki.start_game(language="en", theme=AKINATOR_THEMES.get(theme, "c"))
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Impossible de démarrer Akinator pour le moment: `{exc}`", ephemeral=True)
+            await _cleanup_akinator_session(interaction.user.id)
+            return
+
+    akinator_sessions[interaction.user.id] = {
+        "aki": aki,
+        "channel_id": interaction.channel_id,
+        "started_at": datetime.utcnow().timestamp(),
+    }
+    view = AkinatorQuestionView(interaction.user.id)
+    message = await interaction.followup.send(embed=_akinator_question_embed(interaction.user, aki), view=view, wait=True)
+    view.message = message
 
 
 @game_group.command(name="guess", description="🔢 Devine un nombre entre 1 et 100 (5 essais)")
@@ -5021,10 +5558,12 @@ def _get_economy_profile(user_id: int) -> dict:
         {
             "coins": 0,
             "quests": {},
+            "custom_roles": {},
         },
     )
     profile.setdefault("coins", 0)
     profile.setdefault("quests", {})
+    profile.setdefault("custom_roles", {})
     _ensure_quest_scope(profile, "daily")
     _ensure_quest_scope(profile, "weekly")
     return profile
@@ -5303,11 +5842,11 @@ async def slash_balance(interaction: discord.Interaction, membre: discord.Member
     )
     await interaction.response.send_message(embed=embed, ephemeral=(target == interaction.user))
 
-@tree.command(name="shop", description="🛒 Affiche la boutique liée au gacha")
+@tree.command(name="shop", description="🛒 Affiche la boutique du serveur")
 async def slash_shop(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="🛒 Boutique du gacha",
-        description="Achète des boosts avec tes coins.",
+        title="🛒 Boutique du serveur",
+        description="Achète des boosts, des niveaux et des extras avec tes coins.",
         color=0x8E44AD,
         timestamp=datetime.utcnow(),
     )
@@ -5327,6 +5866,8 @@ async def slash_shop(interaction: discord.Interaction):
     app_commands.Choice(name="Reset total", value="all_reset"),
     app_commands.Choice(name="Boost pity Marvel", value="marvel_pity"),
     app_commands.Choice(name="Boost pity DC", value="dc_pity"),
+    app_commands.Choice(name="Niveau +1", value="level_up"),
+    app_commands.Choice(name="Rôle personnalisable", value="custom_role"),
 ])
 async def slash_buy(interaction: discord.Interaction, item: str):
     if item not in SHOP_ITEMS:
@@ -5336,6 +5877,18 @@ async def slash_buy(interaction: discord.Interaction, item: str):
     econ_profile = _get_economy_profile(interaction.user.id)
     shop_item = SHOP_ITEMS[item]
     price = int(shop_item["price"])
+    custom_role_state = None
+    if item in {"level_up", "custom_role"} and not interaction.guild:
+        await interaction.response.send_message("❌ Cet achat doit être fait depuis le serveur.", ephemeral=True)
+        return
+    if item == "custom_role":
+        custom_role_state = _ensure_custom_role_state(econ_profile, interaction.guild.id)
+        if custom_role_state.get("owned"):
+            await interaction.response.send_message(
+                "❌ Tu as déjà débloqué ton rôle personnalisable. Utilise `/roleperso` pour le modifier.",
+                ephemeral=True,
+            )
+            return
     if int(econ_profile.get("coins", 0)) < price:
         await interaction.response.send_message(
             f"❌ Il te faut **{price} coins** pour acheter `{shop_item['label']}`.",
@@ -5346,19 +5899,33 @@ async def slash_buy(interaction: discord.Interaction, item: str):
     econ_profile["coins"] = int(econ_profile.get("coins", 0)) - price
     gacha_profile = _gacha_get_profile(interaction.user.id)
     pity_map = gacha_profile.setdefault("pity", {})
+    summary = ""
 
     if item == "marvel_reset":
         _gacha_reset_user_counters(interaction.user.id, ["marvel"])
+        summary = "Quota Marvel remis à zéro."
     elif item == "dc_reset":
         _gacha_reset_user_counters(interaction.user.id, ["dc"])
+        summary = "Quota DC remis à zéro."
     elif item == "all_reset":
         _gacha_reset_user_counters(interaction.user.id, ["marvel", "dc"])
+        summary = "Quotas Marvel et DC remis à zéro."
     elif item == "marvel_pity":
         pity_map["marvel"] = min(GACHA_PITY_THRESHOLD, int(pity_map.get("marvel", 0) or 0) + 3)
         save_data()
+        summary = f"Pity Marvel: {pity_map['marvel']}/{GACHA_PITY_THRESHOLD}"
     elif item == "dc_pity":
         pity_map["dc"] = min(GACHA_PITY_THRESHOLD, int(pity_map.get("dc", 0) or 0) + 3)
         save_data()
+        summary = f"Pity DC: {pity_map['dc']}/{GACHA_PITY_THRESHOLD}"
+    elif item == "level_up":
+        old_level, new_level = await _apply_purchased_levels(interaction.user, 1)
+        save_data()
+        summary = f"Niveau **{old_level}** → **{new_level}**"
+    elif item == "custom_role":
+        custom_role_state["owned"] = True
+        save_data()
+        summary = "Utilise `/roleperso nom couleur_hex` pour créer ton rôle."
 
     if item.endswith("_reset"):
         save_data()
@@ -5371,6 +5938,57 @@ async def slash_buy(interaction: discord.Interaction, item: str):
     )
     embed.add_field(name="💸 Dépensé", value=f"{price} coins", inline=True)
     embed.add_field(name="🪙 Solde restant", value=f"{int(econ_profile.get('coins', 0))} coins", inline=True)
+    if summary:
+        embed.add_field(name="📦 Effet", value=summary, inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="roleperso", description="🎨 Crée ou modifie ton rôle personnalisable acheté")
+@app_commands.describe(nom="Nom de ton rôle personnalisé", couleur="Couleur hexadécimale, ex: #FF6B6B")
+async def slash_roleperso(interaction: discord.Interaction, nom: str, couleur: str):
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Cette commande s'utilise sur le serveur.", ephemeral=True)
+        return
+    clean_name = nom.strip()
+    if len(clean_name) < 2 or len(clean_name) > 32:
+        await interaction.response.send_message("❌ Le nom du rôle doit faire entre 2 et 32 caractères.", ephemeral=True)
+        return
+    color = _parse_hex_color(couleur)
+    if not color:
+        await interaction.response.send_message("❌ Couleur invalide. Utilise un hex du type `#FF6B6B`.", ephemeral=True)
+        return
+
+    profile = _get_economy_profile(interaction.user.id)
+    state = _ensure_custom_role_state(profile, interaction.guild.id)
+    if not state.get("owned"):
+        await interaction.response.send_message(
+            "❌ Tu n'as pas encore acheté le rôle personnalisable. Passe par `/shop` puis `/buy custom_role`.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        role, created = await _create_or_update_custom_role(interaction.user, clean_name, color)
+    except PermissionError as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        return
+    except discord.HTTPException as exc:
+        await interaction.response.send_message(f"❌ Discord a refusé la création du rôle: `{exc}`", ephemeral=True)
+        return
+    except ValueError as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🎨 Rôle personnalisé prêt",
+        description="Ton rôle personnalisable a été configuré.",
+        color=color,
+        timestamp=datetime.utcnow(),
+    )
+    embed.add_field(name="🏷️ Nom", value=role.name, inline=True)
+    embed.add_field(name="🎨 Couleur", value=couleur.upper().replace("0X", "#"), inline=True)
+    embed.add_field(name="🧩 Statut", value="Créé" if created else "Mis à jour", inline=True)
+    embed.add_field(name="📌 Rôle", value=role.mention, inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @tree.command(name="gachapull", description="🎴 Invoque un personnage Marvel ou DC")
