@@ -6,6 +6,7 @@ import os
 import random
 import asyncio
 import re
+from html import unescape
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import json
@@ -477,6 +478,65 @@ async def _akinator_post(aki: AsyncAkinator, endpoint: str, data: dict, *, allow
     )
     response.raise_for_status()
     return response
+
+
+def _extract_akinator_value(patterns: list[str], text: str) -> str:
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.S)
+        if match:
+            return unescape(match.group(1)).strip()
+    return ""
+
+
+async def _start_akinator_game(aki: AsyncAkinator, theme: str, *, child_mode: bool = False):
+    errors: list[str] = []
+    for language in ("fr", "en"):
+        for _ in range(2):
+            try:
+                aki.theme = theme
+                aki.language = language
+                aki.child_mode = child_mode
+                response = await aki.session.post(
+                    f"https://{language}.akinator.com/game",
+                    data={"sid": THEME_IDS[theme], "cm": str(child_mode).lower()},
+                )
+                response.raise_for_status()
+                text = response.text
+
+                aki.session_id = _extract_akinator_value([r"#session'\)\.val\('(.+?)'\)"], text)
+                aki.signature = _extract_akinator_value([r"#signature'\)\.val\('(.+?)'\)"], text)
+                aki.identifiant = _extract_akinator_value([r"#identifiant'\)\.val\('(.+?)'\)"], text)
+                aki.question = _extract_akinator_value(
+                    [
+                        r'<p class="question-text" id="question-label">(.+?)</p>',
+                        r'<div class="bubble-body">\s*<p[^>]*id="question-label"[^>]*>(.+?)</p>',
+                    ],
+                    text,
+                )
+
+                if not all([aki.session_id, aki.signature, aki.identifiant, aki.question]):
+                    raise RuntimeError("Réponse de démarrage incomplète")
+
+                aki.proposition = _extract_akinator_value(
+                    [r'<p id="p-sub-bubble">(.+?)</p>'],
+                    text,
+                )
+                aki.progression = 0
+                aki.step = 0
+                aki.akitude = "defi.png"
+                aki.finished = False
+                aki.win = False
+                aki.step_last_proposition = ""
+                aki.id_proposition = None
+                aki.name_proposition = None
+                aki.description_proposition = None
+                aki.flag_photo = None
+                aki.photo = None
+                return
+            except Exception as exc:
+                errors.append(f"{language}:{exc}")
+                await asyncio.sleep(0.6)
+    raise RuntimeError(" ; ".join(errors[-4:]) or "Échec du démarrage Akinator")
 
 
 def _akinator_apply_payload(aki: AsyncAkinator, payload: dict):
@@ -1955,14 +2015,11 @@ async def slash_akinator(interaction: discord.Interaction, theme: str = "personn
     await interaction.response.defer()
     aki = AsyncAkinator()
     try:
-        await aki.start_game(language="fr", theme=AKINATOR_THEMES.get(theme, "c"))
-    except Exception:
-        try:
-            await aki.start_game(language="en", theme=AKINATOR_THEMES.get(theme, "c"))
-        except Exception as exc:
-            await interaction.followup.send(f"❌ Impossible de démarrer Akinator pour le moment: `{exc}`", ephemeral=True)
-            await _cleanup_akinator_session(interaction.user.id)
-            return
+        await _start_akinator_game(aki, AKINATOR_THEMES.get(theme, "c"))
+    except Exception as exc:
+        await interaction.followup.send(f"❌ Impossible de démarrer Akinator pour le moment: `{exc}`", ephemeral=True)
+        await _cleanup_akinator_session(interaction.user.id)
+        return
 
     akinator_sessions[interaction.user.id] = {
         "aki": aki,
