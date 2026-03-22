@@ -307,6 +307,7 @@ AKINATOR_THEMES = {
     "objet": "o",
 }
 akinator_sessions: dict[int, dict] = {}
+akinator_session_counter = 0
 
 # ════════════════════════════════════════════════════════════════
 #  🤖  [2] INTENTS & BOT
@@ -446,14 +447,26 @@ async def _create_or_update_custom_role(member: discord.Member, role_name: str, 
     return role, created
 
 
-def _close_akinator_session(user_id: int):
-    akinator_sessions.pop(user_id, None)
+def _next_akinator_session_token() -> int:
+    global akinator_session_counter
+    akinator_session_counter += 1
+    return akinator_session_counter
 
 
-async def _cleanup_akinator_session(user_id: int):
-    session = akinator_sessions.pop(user_id, None)
+def _get_akinator_session(user_id: int, token: int | None = None) -> dict | None:
+    session = akinator_sessions.get(user_id)
+    if not session:
+        return None
+    if token is not None and int(session.get("token", 0)) != int(token):
+        return None
+    return session
+
+
+async def _cleanup_akinator_session(user_id: int, token: int | None = None):
+    session = _get_akinator_session(user_id, token)
     if not session:
         return
+    akinator_sessions.pop(user_id, None)
     aki = session.get("aki")
     close_method = getattr(getattr(aki, "session", None), "close", None)
     if not close_method:
@@ -721,13 +734,14 @@ def _akinator_finished_embed(user: discord.abc.User, aki: AsyncAkinator) -> disc
 
 
 class AkinatorQuestionView(discord.ui.View):
-    def __init__(self, user_id: int):
+    def __init__(self, user_id: int, token: int):
         super().__init__(timeout=240)
         self.user_id = user_id
+        self.token = token
         self.message: discord.Message | None = None
 
     async def _interaction_check(self, interaction: discord.Interaction) -> bool:
-        session = akinator_sessions.get(self.user_id)
+        session = _get_akinator_session(self.user_id, self.token)
         if not session:
             await interaction.response.send_message("❌ Cette partie Akinator n'est plus active.", ephemeral=True)
             return False
@@ -739,13 +753,16 @@ class AkinatorQuestionView(discord.ui.View):
     async def _handle_answer(self, interaction: discord.Interaction, answer: str):
         if not await self._interaction_check(interaction):
             return
-        session = akinator_sessions[self.user_id]
+        session = _get_akinator_session(self.user_id, self.token)
+        if not session:
+            await interaction.response.send_message("❌ Cette partie Akinator n'est plus active.", ephemeral=True)
+            return
         aki = session["aki"]
         try:
             await _akinator_answer(aki, answer)
         except Exception as exc:
             print(f"⚠️ Akinator answer error: {exc}")
-            await _cleanup_akinator_session(self.user_id)
+            await _cleanup_akinator_session(self.user_id, self.token)
             await interaction.response.edit_message(
                 content=_format_akinator_user_error("la partie"),
                 embed=None,
@@ -754,22 +771,24 @@ class AkinatorQuestionView(discord.ui.View):
             return
 
         if getattr(aki, "finished", False):
-            await _cleanup_akinator_session(self.user_id)
+            await _cleanup_akinator_session(self.user_id, self.token)
             await interaction.response.edit_message(embed=_akinator_finished_embed(interaction.user, aki), view=None)
             return
 
         if _akinator_has_guess(aki):
-            guess_view = AkinatorGuessView(self.user_id)
+            guess_view = AkinatorGuessView(self.user_id, self.token)
             guess_view.message = interaction.message
             await interaction.response.edit_message(embed=_akinator_guess_embed(interaction.user, aki), view=guess_view)
             return
 
-        new_view = AkinatorQuestionView(self.user_id)
+        new_view = AkinatorQuestionView(self.user_id, self.token)
         new_view.message = interaction.message
         await interaction.response.edit_message(embed=_akinator_question_embed(interaction.user, aki), view=new_view)
 
     async def on_timeout(self):
-        await _cleanup_akinator_session(self.user_id)
+        if not _get_akinator_session(self.user_id, self.token):
+            return
+        await _cleanup_akinator_session(self.user_id, self.token)
         if not self.message:
             return
         try:
@@ -801,7 +820,10 @@ class AkinatorQuestionView(discord.ui.View):
     async def back(self, interaction: discord.Interaction, _: discord.ui.Button):
         if not await self._interaction_check(interaction):
             return
-        session = akinator_sessions[self.user_id]
+        session = _get_akinator_session(self.user_id, self.token)
+        if not session:
+            await interaction.response.send_message("❌ Cette partie Akinator n'est plus active.", ephemeral=True)
+            return
         aki = session["aki"]
         try:
             await _akinator_back(aki)
@@ -810,10 +832,10 @@ class AkinatorQuestionView(discord.ui.View):
             return
         except Exception as exc:
             print(f"⚠️ Akinator back error: {exc}")
-            await _cleanup_akinator_session(self.user_id)
+            await _cleanup_akinator_session(self.user_id, self.token)
             await interaction.response.edit_message(content=_format_akinator_user_error("le retour arrière"), embed=None, view=None)
             return
-        new_view = AkinatorQuestionView(self.user_id)
+        new_view = AkinatorQuestionView(self.user_id, self.token)
         new_view.message = interaction.message
         await interaction.response.edit_message(embed=_akinator_question_embed(interaction.user, aki), view=new_view)
 
@@ -821,18 +843,19 @@ class AkinatorQuestionView(discord.ui.View):
     async def stop(self, interaction: discord.Interaction, _: discord.ui.Button):
         if not await self._interaction_check(interaction):
             return
-        await _cleanup_akinator_session(self.user_id)
+        await _cleanup_akinator_session(self.user_id, self.token)
         await interaction.response.edit_message(content="🛑 Partie Akinator arrêtée.", embed=None, view=None)
 
 
 class AkinatorGuessView(discord.ui.View):
-    def __init__(self, user_id: int):
+    def __init__(self, user_id: int, token: int):
         super().__init__(timeout=180)
         self.user_id = user_id
+        self.token = token
         self.message: discord.Message | None = None
 
     async def _interaction_check(self, interaction: discord.Interaction) -> bool:
-        session = akinator_sessions.get(self.user_id)
+        session = _get_akinator_session(self.user_id, self.token)
         if not session:
             await interaction.response.send_message("❌ Cette partie Akinator n'est plus active.", ephemeral=True)
             return False
@@ -842,7 +865,9 @@ class AkinatorGuessView(discord.ui.View):
         return True
 
     async def on_timeout(self):
-        await _cleanup_akinator_session(self.user_id)
+        if not _get_akinator_session(self.user_id, self.token):
+            return
+        await _cleanup_akinator_session(self.user_id, self.token)
         if not self.message:
             return
         try:
@@ -854,33 +879,39 @@ class AkinatorGuessView(discord.ui.View):
     async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button):
         if not await self._interaction_check(interaction):
             return
-        session = akinator_sessions[self.user_id]
+        session = _get_akinator_session(self.user_id, self.token)
+        if not session:
+            await interaction.response.send_message("❌ Cette partie Akinator n'est plus active.", ephemeral=True)
+            return
         aki = session["aki"]
         try:
             await _akinator_answer(aki, "yes")
         except Exception as exc:
             print(f"⚠️ Akinator confirm error: {exc}")
-            await _cleanup_akinator_session(self.user_id)
+            await _cleanup_akinator_session(self.user_id, self.token)
             await interaction.response.edit_message(content=_format_akinator_user_error("la validation"), embed=None, view=None)
             return
-        await _cleanup_akinator_session(self.user_id)
+        await _cleanup_akinator_session(self.user_id, self.token)
         await interaction.response.edit_message(embed=_akinator_finished_embed(interaction.user, aki), view=None)
 
     @discord.ui.button(label="Non, continue", style=discord.ButtonStyle.primary)
     async def deny(self, interaction: discord.Interaction, _: discord.ui.Button):
         if not await self._interaction_check(interaction):
             return
-        session = akinator_sessions[self.user_id]
+        session = _get_akinator_session(self.user_id, self.token)
+        if not session:
+            await interaction.response.send_message("❌ Cette partie Akinator n'est plus active.", ephemeral=True)
+            return
         aki = session["aki"]
         try:
             await _akinator_answer(aki, "no")
         except Exception as exc:
             print(f"⚠️ Akinator deny error: {exc}")
-            await _cleanup_akinator_session(self.user_id)
+            await _cleanup_akinator_session(self.user_id, self.token)
             await interaction.response.edit_message(content=_format_akinator_user_error("la relance"), embed=None, view=None)
             return
 
-        new_view = AkinatorQuestionView(self.user_id)
+        new_view = AkinatorQuestionView(self.user_id, self.token)
         new_view.message = interaction.message
         await interaction.response.edit_message(embed=_akinator_question_embed(interaction.user, aki), view=new_view)
 
@@ -888,7 +919,7 @@ class AkinatorGuessView(discord.ui.View):
     async def stop(self, interaction: discord.Interaction, _: discord.ui.Button):
         if not await self._interaction_check(interaction):
             return
-        await _cleanup_akinator_session(self.user_id)
+        await _cleanup_akinator_session(self.user_id, self.token)
         await interaction.response.edit_message(content="🛑 Partie Akinator arrêtée.", embed=None, view=None)
 
 def get_stats_for_days(user_id: int, days: int) -> dict:
@@ -2032,10 +2063,11 @@ async def slash_akinator(interaction: discord.Interaction, theme: str = "personn
 
     akinator_sessions[interaction.user.id] = {
         "aki": aki,
+        "token": _next_akinator_session_token(),
         "channel_id": interaction.channel_id,
         "started_at": datetime.utcnow().timestamp(),
     }
-    view = AkinatorQuestionView(interaction.user.id)
+    view = AkinatorQuestionView(interaction.user.id, akinator_sessions[interaction.user.id]["token"])
     message = await interaction.followup.send(embed=_akinator_question_embed(interaction.user, aki), view=view, wait=True)
     view.message = message
 
