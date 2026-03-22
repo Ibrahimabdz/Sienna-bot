@@ -131,7 +131,7 @@ async def send_welcome_dm(member: discord.Member, *, preview: bool = False) -> b
     embed = build_welcome_dm_embed(member, preview=preview)
     if WELCOME_GIF_ENABLED:
         try:
-            buf = await make_welcome_gif(member, is_welcome=not preview)
+            buf = await make_welcome_gif(member, is_welcome=True)
             file = discord.File(buf, filename="bienvenue.gif")
             embed.set_image(url="attachment://bienvenue.gif")
             await member.send(embed=embed, file=file)
