@@ -300,7 +300,6 @@ DISABLED_SLASH_COMMANDS = [
     "lgstatus",
     "lgarreter",
 ]
-AKINATOR_GUESS_THRESHOLD = 80
 AKINATOR_THEMES = {
     "personnage": "c",
     "animal": "a",
@@ -637,6 +636,10 @@ def _akinator_guess_embed(user: discord.abc.User, aki: AsyncAkinator) -> discord
     return embed
 
 
+def _akinator_has_guess(aki: AsyncAkinator) -> bool:
+    return bool(getattr(aki, "win", False) and getattr(aki, "name_proposition", None))
+
+
 def _akinator_finished_embed(user: discord.abc.User, aki: AsyncAkinator) -> discord.Embed:
     embed = discord.Embed(
         title="✅ Akinator terminé",
@@ -690,7 +693,7 @@ class AkinatorQuestionView(discord.ui.View):
             await interaction.response.edit_message(embed=_akinator_finished_embed(interaction.user, aki), view=None)
             return
 
-        if getattr(aki, "win", False) or float(getattr(aki, "progression", 0) or 0) >= AKINATOR_GUESS_THRESHOLD:
+        if _akinator_has_guess(aki):
             guess_view = AkinatorGuessView(self.user_id)
             guess_view.message = interaction.message
             await interaction.response.edit_message(embed=_akinator_guess_embed(interaction.user, aki), view=guess_view)
