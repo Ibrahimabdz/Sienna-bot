@@ -10,6 +10,7 @@ from html import unescape
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import json
+from types import SimpleNamespace
 
 # Import du générateur de carte stats
 try:
@@ -226,6 +227,9 @@ def load_data():
 #  ⚙️  [1] CONFIGURATION & VARIABLES
 # ════════════════════════════════════════════════════════════════
 TOKEN                  = os.getenv("DISCORD_TOKEN", "VOTRE_TOKEN_ICI")
+AKINATOR_SERVICE_URL   = os.getenv("AKINATOR_SERVICE_URL", "").rstrip("/")
+AKINATOR_SERVICE_TOKEN = os.getenv("AKINATOR_SERVICE_TOKEN", "")
+AKINATOR_SERVICE_TIMEOUT = int(os.getenv("AKINATOR_SERVICE_TIMEOUT", "25"))
 WELCOME_CHANNEL_ID     = int(os.getenv("WELCOME_CHANNEL_ID", 0))
 GOODBYE_CHANNEL_ID     = int(os.getenv("GOODBYE_CHANNEL_ID", 0))
 FREE_GAMES_CHANNEL_ID  = int(os.getenv("FREE_GAMES_CHANNEL_ID", 0))
@@ -470,6 +474,12 @@ async def _cleanup_akinator_session(user_id: int, token: int | None = None):
         return
     akinator_sessions.pop(user_id, None)
     aki = session.get("aki")
+    if aki and _is_remote_akinator(aki):
+        try:
+            await _akinator_remote_request("/close", {"session_id": aki._remote_session_id})
+        except Exception:
+            pass
+        return
     close_method = getattr(getattr(aki, "session", None), "close", None)
     if not close_method:
         return
@@ -483,6 +493,60 @@ async def _cleanup_akinator_session(user_id: int, token: int | None = None):
 
 def _akinator_theme_label(theme: str) -> str:
     return {"c": "Personnage", "a": "Animal", "o": "Objet"}.get(theme, "Personnage")
+
+
+def _akinator_use_remote_service() -> bool:
+    return bool(AKINATOR_SERVICE_URL)
+
+
+def _akinator_remote_headers() -> dict:
+    headers = {"Content-Type": "application/json"}
+    if AKINATOR_SERVICE_TOKEN:
+        headers["Authorization"] = f"Bearer {AKINATOR_SERVICE_TOKEN}"
+    return headers
+
+
+def _is_remote_akinator(aki) -> bool:
+    return bool(getattr(aki, "_remote_session_id", ""))
+
+
+def _remote_akinator_state_to_obj(payload: dict):
+    state = payload.get("state", payload)
+    aki = SimpleNamespace()
+    for key, value in state.items():
+        setattr(aki, key, value)
+    if payload.get("session_id"):
+        setattr(aki, "_remote_session_id", payload["session_id"])
+    return aki
+
+
+def _update_remote_akinator_state(aki, payload: dict):
+    state = payload.get("state", payload)
+    for key, value in state.items():
+        setattr(aki, key, value)
+    if payload.get("session_id"):
+        setattr(aki, "_remote_session_id", payload["session_id"])
+    return aki
+
+
+async def _akinator_remote_request(path: str, payload: dict | None = None, *, method: str = "POST") -> dict:
+    if not _akinator_use_remote_service():
+        raise RuntimeError("Service Akinator distant non configuré.")
+    timeout = aiohttp.ClientTimeout(total=AKINATOR_SERVICE_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.request(
+            method,
+            f"{AKINATOR_SERVICE_URL}{path}",
+            headers=_akinator_remote_headers(),
+            json=payload,
+        ) as response:
+            if response.status >= 400:
+                body = await response.text()
+                raise RuntimeError(f"Akinator service HTTP {response.status}: {body[:200]}")
+            if response.content_type == "application/json":
+                return await response.json()
+            text = await response.text()
+            return {"raw": text}
 
 
 def _make_akinator_client(browser_platform: str | None = None) -> AsyncAkinator:
@@ -663,6 +727,14 @@ def _akinator_apply_payload(aki: AsyncAkinator, payload: dict):
 
 
 async def _akinator_answer(aki: AsyncAkinator, answer: str):
+    if _is_remote_akinator(aki):
+        payload = await _akinator_remote_request(
+            "/answer",
+            {"session_id": aki._remote_session_id, "answer": answer},
+        )
+        _update_remote_akinator_state(aki, payload)
+        return payload
+
     if aki.win:
         if answer == "yes":
             response = await _akinator_post(
@@ -719,6 +791,14 @@ async def _akinator_answer(aki: AsyncAkinator, answer: str):
 
 
 async def _akinator_back(aki: AsyncAkinator):
+    if _is_remote_akinator(aki):
+        payload = await _akinator_remote_request(
+            "/back",
+            {"session_id": aki._remote_session_id},
+        )
+        _update_remote_akinator_state(aki, payload)
+        return payload
+
     if int(getattr(aki, "step", 0) or 0) <= 0:
         raise ValueError("Tu es déjà à la première question.")
     aki.win = False
@@ -2092,9 +2172,9 @@ async def slash_slots(interaction: discord.Interaction):
     app_commands.Choice(name="Objet", value="objet"),
 ])
 async def slash_akinator(interaction: discord.Interaction, theme: str = "personnage"):
-    if not AKINATOR_ENABLED:
+    if not AKINATOR_ENABLED and not _akinator_use_remote_service():
         await interaction.response.send_message(
-            "❌ Akinator n'est pas disponible sur cette instance. Ajoute la dépendance `akinator` puis redémarre le bot.",
+            "❌ Akinator n'est pas disponible sur cette instance. Installe la dépendance locale ou configure `AKINATOR_SERVICE_URL`.",
             ephemeral=True,
         )
         return
@@ -2104,9 +2184,16 @@ async def slash_akinator(interaction: discord.Interaction, theme: str = "personn
         await _cleanup_akinator_session(interaction.user.id)
 
     await interaction.response.defer()
-    aki = _make_akinator_client()
     try:
-        await _start_akinator_game(aki, AKINATOR_THEMES.get(theme, "c"))
+        if _akinator_use_remote_service():
+            payload = await _akinator_remote_request(
+                "/start",
+                {"theme": AKINATOR_THEMES.get(theme, "c"), "child_mode": False},
+            )
+            aki = _remote_akinator_state_to_obj(payload)
+        else:
+            aki = _make_akinator_client()
+            await _start_akinator_game(aki, AKINATOR_THEMES.get(theme, "c"))
     except Exception as exc:
         print(f"⚠️ Akinator startup error: {exc}")
         await interaction.followup.send(_format_akinator_user_error("le démarrage", exc), ephemeral=True)
