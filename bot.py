@@ -487,15 +487,23 @@ def _akinator_theme_label(theme: str) -> str:
 
 def _make_akinator_client(browser_platform: str | None = None) -> AsyncAkinator:
     browser_platform = browser_platform or ("windows" if os.name == "nt" else "linux")
+    if browser_platform == "linux":
+        user_agent = (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/133.0.0.0 Safari/537.36"
+        )
+    else:
+        user_agent = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/133.0.0.0 Safari/537.36"
+        )
     session = AsyncCloudScraper(
         browser={"browser": "chrome", "platform": browser_platform, "desktop": True}
     )
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/133.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": user_agent,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
         "Cache-Control": "no-cache",
@@ -608,7 +616,7 @@ async def _start_akinator_game(aki: AsyncAkinator, theme: str, *, child_mode: bo
                 except Exception as exc:
                     errors.append(f"{strategy_name}:{browser_platform}:{language}:{exc!r}")
                     await asyncio.sleep(0.5)
-    raise RuntimeError(" ; ".join(errors[-4:]) or "Échec du démarrage Akinator")
+    raise RuntimeError(" ; ".join(errors) or "Échec du démarrage Akinator")
 
 
 def _format_akinator_user_error(action: str, error: Exception | None = None) -> str:
