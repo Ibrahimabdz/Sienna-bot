@@ -99,8 +99,7 @@ def build_welcome_dm_embed(member: discord.Member, *, preview: bool = False) -> 
     embed = discord.Embed(
         title=title,
         description=(
-            f"Salut {member.mention}, bienvenue sur **{guild.name}**.\n\n"
-            "Avant de commencer, prends 2 minutes pour bien t'installer dans la Taverne."
+            f"Bienvenue {member.mention} sur **{guild.name}**."
         ),
         color=0x8B0000,
         timestamp=datetime.utcnow()
@@ -112,14 +111,9 @@ def build_welcome_dm_embed(member: discord.Member, *, preview: bool = False) -> 
         value=(
             "• Lire le règlement et cocher la réaction demandée\n"
             "• Accepter les règles pour débloquer l'accès à tous les salons\n"
-            "• Parcourir les catégories et salons importants\n"
-            "• Choisir une couleur pour ton rôle et tes notifications si besoin"
+            "• Parcourir les salons importants\n"
+            "• Choisir une couleur de rôle"
         ),
-        inline=False
-    )
-    embed.add_field(
-        name="📜 Conseil",
-        value="Commence par le salon règlement, valide la réaction demandée puis découvre tranquillement les différentes catégories du serveur.",
         inline=False
     )
     footer = "Aperçu admin du MP de bienvenue" if preview else "Bonne installation dans la Taverne"
