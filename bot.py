@@ -527,51 +527,14 @@ def _extract_akinator_value(patterns: list[str], text: str) -> str:
 async def _start_akinator_game(aki: AsyncAkinator, theme: str, *, child_mode: bool = False):
     errors: list[str] = []
     for language in ("fr", "en"):
-        for _ in range(2):
+        for attempt in range(2):
             try:
-                aki.theme = theme
-                aki.language = language
-                aki.child_mode = child_mode
-                headers = {
-                    "Origin": f"https://{language}.akinator.com",
-                    "Referer": f"https://{language}.akinator.com/",
-                    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-                }
-                scraper = getattr(aki.session, "scraper", None)
-                if scraper:
-                    scraper.headers.update(headers)
-                    await asyncio.to_thread(
-                        scraper.get,
-                        f"https://{language}.akinator.com/",
-                        headers=headers,
-                        timeout=20,
-                        allow_redirects=True,
-                    )
-                response = await aki.session.post(
-                    f"https://{language}.akinator.com/game",
-                    data={"sid": THEME_IDS[theme], "cm": str(child_mode).lower()},
-                    headers=headers,
-                )
-                response.raise_for_status()
-                text = response.text
-
-                aki.session_id = _extract_akinator_value([r"#session'\)\.val\('(.+?)'\)"], text)
-                aki.signature = _extract_akinator_value([r"#signature'\)\.val\('(.+?)'\)"], text)
-                aki.identifiant = _extract_akinator_value([r"#identifiant'\)\.val\('(.+?)'\)"], text)
-                aki.question = _extract_akinator_value(
-                    [
-                        r'<p class="question-text" id="question-label">(.+?)</p>',
-                        r'<div class="bubble-body">\s*<p[^>]*id="question-label"[^>]*>(.+?)</p>',
-                    ],
-                    text,
-                )
-
-                if not all([aki.session_id, aki.signature, aki.identifiant, aki.question]):
-                    raise RuntimeError("Réponse de démarrage incomplète")
-
-                aki.proposition = _extract_akinator_value(
-                    [r'<p id="p-sub-bubble">(.+?)</p>'],
-                    text,
+                if attempt > 0 or language != "fr":
+                    fresh_client = _make_akinator_client()
+                    aki.session = fresh_client.session
+                await asyncio.wait_for(
+                    aki.start_game(language=language, child_mode=child_mode, theme=theme),
+                    timeout=20,
                 )
                 aki.progression = 0
                 aki.step = 0
@@ -586,14 +549,14 @@ async def _start_akinator_game(aki: AsyncAkinator, theme: str, *, child_mode: bo
                 aki.photo = None
                 return
             except Exception as exc:
-                errors.append(f"{language}:{exc}")
+                errors.append(f"{language}#{attempt + 1}:{exc!r}")
                 await asyncio.sleep(0.6)
     raise RuntimeError(" ; ".join(errors[-4:]) or "Échec du démarrage Akinator")
 
 
 def _format_akinator_user_error(action: str, error: Exception | None = None) -> str:
     if error and "403" in str(error):
-        return f"❌ Akinator bloque actuellement la connexion du bot pendant {action}. Réessaie plus tard."
+        return f"❌ Akinator a refusé la session pendant {action}. Réessaie dans quelques secondes."
     return f"❌ Akinator est indisponible pour le moment pendant {action}. Réessaie dans quelques secondes."
 
 
