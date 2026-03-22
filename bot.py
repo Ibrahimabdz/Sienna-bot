@@ -5359,6 +5359,20 @@ def _cv_clean_text(raw: str, max_len: int = 320) -> str:
         text = text[: max_len - 1].rstrip() + "…"
     return text
 
+def _cv_matches_publisher(raw: dict, publisher_id: int) -> bool:
+    publisher = raw.get("publisher") or {}
+    try:
+        if int(publisher.get("id") or 0) == publisher_id:
+            return True
+    except (TypeError, ValueError):
+        pass
+    api_detail_url = str(publisher.get("api_detail_url") or "")
+    if api_detail_url.endswith(f"/4010-{publisher_id}/"):
+        return True
+    publisher_name = str(publisher.get("name") or "").strip().lower()
+    expected_name = _publisher_meta(publisher_id)["name"].strip().lower()
+    return publisher_name == expected_name
+
 def _cv_month_bounds(target: datetime | None = None) -> tuple[str, str, str]:
     import calendar as _cal
 
@@ -5392,31 +5406,51 @@ async def _cv_request(endpoint: str, params: dict) -> dict:
     params = dict(params)
     params["api_key"] = COMICVINE_API_KEY
     params["format"] = "json"
-    async with aiohttp.ClientSession() as s:
-        async with s.get(
-            f"{COMICVINE_BASE}/{endpoint}",
-            params=params,
-            headers=COMICVINE_HEADERS,
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as r:
-            if r.status != 200:
-                return {}
-            return await r.json()
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                f"{COMICVINE_BASE}/{endpoint}",
+                params=params,
+                headers=COMICVINE_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                if r.status != 200:
+                    print(f"⚠️ ComicVine {endpoint}: HTTP {r.status}")
+                    return {}
+                try:
+                    return await r.json()
+                except Exception as exc:
+                    body = await r.text()
+                    print(f"⚠️ ComicVine {endpoint}: réponse JSON invalide ({exc}) :: {body[:180]}")
+                    return {}
+    except Exception as exc:
+        print(f"⚠️ ComicVine {endpoint}: requête impossible ({exc})")
+        return {}
 
 async def _cv_request_url(url: str, params: dict) -> dict:
     params = dict(params)
     params["api_key"] = COMICVINE_API_KEY
     params["format"] = "json"
-    async with aiohttp.ClientSession() as s:
-        async with s.get(
-            url,
-            params=params,
-            headers=COMICVINE_HEADERS,
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as r:
-            if r.status != 200:
-                return {}
-            return await r.json()
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                url,
+                params=params,
+                headers=COMICVINE_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                if r.status != 200:
+                    print(f"⚠️ ComicVine URL {url}: HTTP {r.status}")
+                    return {}
+                try:
+                    return await r.json()
+                except Exception as exc:
+                    body = await r.text()
+                    print(f"⚠️ ComicVine URL {url}: réponse JSON invalide ({exc}) :: {body[:180]}")
+                    return {}
+    except Exception as exc:
+        print(f"⚠️ ComicVine URL {url}: requête impossible ({exc})")
+        return {}
 
 async def _cv_get_volume_publisher(volume: dict) -> dict:
     volume = volume or {}
@@ -5815,12 +5849,14 @@ async def _cv_fetch_character_pool(publisher_id: int, max_items: int = 180) -> l
 
     items: list[dict] = []
     seen_ids: set[int] = set()
-    for offset in range(0, max_items, 100):
+    # ComicVine expose mal le filtrage par publisher sur /characters, donc on scanne
+    # plusieurs pages triées par popularité puis on filtre localement.
+    scan_limit = max(max_items * 6, 600)
+    for offset in range(0, scan_limit, 100):
         params = {
             "sort": "count_of_issue_appearances:desc",
             "limit": 100,
             "offset": offset,
-            "filter": f"publisher:{publisher_id}",
             "field_list": "id,name,real_name,image,deck,site_detail_url,count_of_issue_appearances,publisher",
         }
         data = await _cv_request("characters", params)
@@ -5828,6 +5864,8 @@ async def _cv_fetch_character_pool(publisher_id: int, max_items: int = 180) -> l
         if not batch:
             break
         for raw in batch:
+            if not _cv_matches_publisher(raw, publisher_id):
+                continue
             cid = int(raw.get("id") or 0)
             if not cid or cid in seen_ids:
                 continue
@@ -5845,10 +5883,15 @@ async def _cv_fetch_character_pool(publisher_id: int, max_items: int = 180) -> l
                     "publisher": _publisher_meta(publisher_id)["name"],
                 }
             )
+            if len(items) >= max_items:
+                break
+        if len(items) >= max_items:
+            break
         if len(batch) < 100:
             break
         await asyncio.sleep(0.25)
 
+    items = items[:max_items]
     for index, item in enumerate(items):
         item["rarity"] = _gacha_rarity_for_index(index, len(items))
 
