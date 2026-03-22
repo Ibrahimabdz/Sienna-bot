@@ -92,6 +92,39 @@ def mark_data_dirty():
     global _data_dirty
     _data_dirty = True
 
+
+def build_welcome_dm_embed(member: discord.Member, *, preview: bool = False) -> discord.Embed:
+    guild = member.guild
+    title = "✉️ Aperçu du message de bienvenue" if preview else "🍺 Bienvenue à La Taverne"
+    embed = discord.Embed(
+        title=title,
+        description=(
+            f"Salut {member.mention}, bienvenue sur **{guild.name}**.\n\n"
+            "Avant de commencer, prends 2 minutes pour bien t'installer dans la Taverne."
+        ),
+        color=0x8B0000,
+        timestamp=datetime.utcnow()
+    )
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.add_field(
+        name="✅ À faire en arrivant",
+        value=(
+            "• Lire et accepter le règlement\n"
+            "• Parcourir toutes les catégories et les salons importants\n"
+            "• Choisir tes rôles et notifications si besoin"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="📜 Conseil",
+        value="Commence par le salon règlement puis découvre tranquillement les différentes catégories du serveur.",
+        inline=False
+    )
+    footer = "Aperçu admin du MP de bienvenue" if preview else "Bonne installation dans la Taverne"
+    embed.set_footer(text=footer, icon_url=guild.icon.url if guild.icon else None)
+    return embed
+
 def load_data():
     """Charge toutes les données depuis data.json au démarrage"""
     global xp_data, warns, reaction_roles
@@ -613,10 +646,6 @@ async def on_member_join(member: discord.Member):
         log.add_field(name="📊 Utilisations",    value=f"{invite_uses} fois",                inline=True)
     else:
         log.add_field(name="✉️ Invité par", value="Inconnu (lien vanity ou DM ?)", inline=False)
-    log.set_footer(text=f"ID : {member.id}")
-    await send_log(guild, log)
-    await update_counters(guild)
-
     # Auto-rôles
     for role_id in AUTO_ROLES:
         role = guild.get_role(role_id)
@@ -626,35 +655,42 @@ async def on_member_join(member: discord.Member):
             except Exception:
                 pass
 
+    dm_sent = await send_dm(member, build_welcome_dm_embed(member))
+    log.add_field(name="📩 MP bienvenue", value="✅ Envoyé" if dm_sent else "❌ DMs fermés", inline=True)
+    log.set_footer(text=f"ID : {member.id}")
+    await send_log(guild, log)
+    await update_counters(guild)
+
     # Message de bienvenue
     ch_id = WELCOME_CHANNEL_ID
-    if not ch_id:
-        return
-    ch = guild.get_channel(ch_id)
-    if not ch:
-        return
-    try:
-        from welcome_card import make_welcome_gif
-        buf  = await make_welcome_gif(member, is_welcome=True)
-        file = discord.File(buf, filename="bienvenue.gif")
-        embed = discord.Embed(
-            description=(
-                f"Les portes s'ouvrent pour {member.mention} ! 🍺\n\n"
-                "┣ ✅ Accepte les **règles**\n"
-                f"┗ 🎭 Choisis tes **rôles** !"
-            ),
-            color=0x8B0000
-        )
-        embed.set_image(url="attachment://bienvenue.gif")
-        embed.set_footer(text=f"🍻 Aventurier #{guild.member_count}", icon_url=guild.icon.url if guild.icon else None)
-        await ch.send(embed=embed, file=file)
-    except Exception:
-        embed = discord.Embed(
-            title="⚔️ Bienvenue à la Taverne !",
-            description=f"Heureux de t'accueillir {member.mention} ! 🍺",
-            color=0x8B0000
-        )
-        await ch.send(embed=embed)
+    ch = guild.get_channel(ch_id) if ch_id else None
+    if ch:
+        try:
+            from welcome_card import make_welcome_gif
+            buf  = await make_welcome_gif(member, is_welcome=True)
+            file = discord.File(buf, filename="bienvenue.gif")
+            embed = discord.Embed(
+                description=(
+                    f"Les portes s'ouvrent pour {member.mention} ! 🍺\n\n"
+                    "┣ ✅ Accepte les **règles**\n"
+                    "┣ 🧭 Parcours les **catégories et salons**\n"
+                    "┗ 🎭 Choisis tes **rôles**"
+                ),
+                color=0x8B0000
+            )
+            embed.set_image(url="attachment://bienvenue.gif")
+            embed.set_footer(text=f"🍻 Aventurier #{guild.member_count}", icon_url=guild.icon.url if guild.icon else None)
+            await ch.send(embed=embed, file=file)
+        except Exception:
+            embed = discord.Embed(
+                title="⚔️ Bienvenue à la Taverne !",
+                description=(
+                    f"Heureux de t'accueillir {member.mention} ! 🍺\n\n"
+                    "Merci de lire les règles, parcourir les catégories et choisir tes rôles avant de participer."
+                ),
+                color=0x8B0000
+            )
+            await ch.send(embed=embed)
 
     # Mention dans le salon règlement (supprimée après 10 min) — en tâche async pour ne pas bloquer
     if REGLEMENT_CHANNEL_ID:
@@ -1576,6 +1612,48 @@ async def slash_setlevelup(interaction: discord.Interaction, channel: discord.Te
     LEVELUP_CHANNEL_ID = channel.id
     save_data()
     await interaction.response.send_message(f"✅ Salon level-up : {channel.mention}", ephemeral=True)
+
+
+def find_member_for_welcome_preview(guild: discord.Guild, lookup: str = "b000o000") -> discord.Member | None:
+    needle = lookup.strip().lower()
+    for member in guild.members:
+        names = {
+            member.name.lower(),
+            member.display_name.lower(),
+        }
+        global_name = getattr(member, "global_name", None)
+        if global_name:
+            names.add(global_name.lower())
+        if needle in names:
+            return member
+    return None
+
+
+@tree.command(name="previewbienvenue", description="[Admin] Envoie un aperçu du MP de bienvenue")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(membre="Membre qui doit recevoir l'aperçu")
+async def slash_previewbienvenue(interaction: discord.Interaction, membre: discord.Member | None = None):
+    await interaction.response.defer(ephemeral=True)
+    target = membre or find_member_for_welcome_preview(interaction.guild, "b000o000")
+    if not target:
+        await interaction.followup.send(
+            "❌ Impossible de trouver `b000o000`. Mentionne directement le membre dans la commande.",
+            ephemeral=True
+        )
+        return
+
+    dm_sent = await send_dm(target, build_welcome_dm_embed(target, preview=True))
+    if not dm_sent:
+        await interaction.followup.send(
+            f"❌ Impossible d'envoyer le MP à {target.mention} (DMs fermés).",
+            ephemeral=True
+        )
+        return
+
+    await interaction.followup.send(
+        f"✅ Aperçu du message de bienvenue envoyé en MP à {target.mention}.",
+        ephemeral=True
+    )
 
 # Liste des rôles donnés automatiquement à l'arrivée
 AUTO_ROLES: list[int] = [AUTO_ROLE_ID] if AUTO_ROLE_ID else []
