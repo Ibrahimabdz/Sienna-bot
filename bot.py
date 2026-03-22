@@ -578,6 +578,11 @@ def _akinator_apply_payload(aki: AsyncAkinator, payload: dict):
 
     aki.win = False
     aki.finished = False
+    aki.id_proposition = None
+    aki.name_proposition = None
+    aki.description_proposition = None
+    aki.flag_photo = None
+    aki.photo = None
     if "step" in payload:
         aki.step = int(float(payload["step"]))
     if "progression" in payload:
@@ -612,24 +617,7 @@ async def _akinator_answer(aki: AsyncAkinator, answer: str):
             aki.progression = 100
             return response
         if answer == "no":
-            aki.win = False
-            aki.id_proposition = ""
-            response = await _akinator_post(
-                aki,
-                "exclude",
-                {
-                    "step": int(aki.step) + 1,
-                    "progression": aki.progression,
-                    "sid": THEME_IDS[aki.theme],
-                    "cm": str(aki.child_mode).lower(),
-                    "session": aki.session_id,
-                    "signature": aki.signature,
-                    "forward_answer": 1,
-                },
-            )
-            payload = response.json()
-            _akinator_apply_payload(aki, payload)
-            return payload
+            return await _akinator_back(aki)
         raise ValueError("Après une proposition, réponds seulement par oui ou non.")
 
     answer_map = {
