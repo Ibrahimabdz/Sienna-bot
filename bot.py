@@ -110,15 +110,16 @@ def build_welcome_dm_embed(member: discord.Member, *, preview: bool = False) -> 
     embed.add_field(
         name="✅ À faire en arrivant",
         value=(
-            "• Lire et accepter le règlement\n"
-            "• Parcourir toutes les catégories et les salons importants\n"
-            "• Choisir tes rôles et notifications si besoin"
+            "• Lire le règlement et cocher la réaction demandée\n"
+            "• Accepter les règles pour débloquer l'accès à tous les salons\n"
+            "• Parcourir les catégories et salons importants\n"
+            "• Choisir une couleur pour ton rôle et tes notifications si besoin"
         ),
         inline=False
     )
     embed.add_field(
         name="📜 Conseil",
-        value="Commence par le salon règlement puis découvre tranquillement les différentes catégories du serveur.",
+        value="Commence par le salon règlement, valide la réaction demandée puis découvre tranquillement les différentes catégories du serveur.",
         inline=False
     )
     footer = "Aperçu admin du MP de bienvenue" if preview else "Bonne installation dans la Taverne"
@@ -672,9 +673,9 @@ async def on_member_join(member: discord.Member):
             embed = discord.Embed(
                 description=(
                     f"Les portes s'ouvrent pour {member.mention} ! 🍺\n\n"
-                    "┣ ✅ Accepte les **règles**\n"
+                    "┣ ✅ Réagis au **règlement** pour accéder à tous les salons\n"
                     "┣ 🧭 Parcours les **catégories et salons**\n"
-                    "┗ 🎭 Choisis tes **rôles**"
+                    "┗ 🎨 Choisis une **couleur de rôle** et tes rôles"
                 ),
                 color=0x8B0000
             )
@@ -686,7 +687,7 @@ async def on_member_join(member: discord.Member):
                 title="⚔️ Bienvenue à la Taverne !",
                 description=(
                     f"Heureux de t'accueillir {member.mention} ! 🍺\n\n"
-                    "Merci de lire les règles, parcourir les catégories et choisir tes rôles avant de participer."
+                    "Merci de valider la réaction du règlement pour débloquer tous les salons, puis de parcourir les catégories et choisir une couleur de rôle avant de participer."
                 ),
                 color=0x8B0000
             )
