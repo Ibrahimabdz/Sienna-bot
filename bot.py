@@ -267,6 +267,7 @@ warns: dict[int, list] = {}  # {user_id: [{raison, mod, date}]}
 GACHA_WINDOW_SECONDS = 3600
 GACHA_PULLS_PER_HOUR = 10
 GACHA_PITY_THRESHOLD = 20
+GACHA_POOL_SIZE = 60
 DISBOARD_BOT_ID = 302050872383242240
 
 # ── Quêtes & économie
@@ -5841,17 +5842,18 @@ def _gacha_rarity_for_index(index: int, total: int) -> str:
         return "Rare"
     return "Commun"
 
-async def _cv_fetch_character_pool(publisher_id: int, max_items: int = 180) -> list[dict]:
+async def _cv_fetch_character_pool(publisher_id: int, max_items: int = GACHA_POOL_SIZE) -> list[dict]:
     cached = cv_character_pool_cache.get(publisher_id)
     now_ts = datetime.utcnow().timestamp()
     if cached and now_ts - cached.get("ts", 0) < 6 * 3600:
         return cached.get("items", [])
 
+    started_at = datetime.utcnow().timestamp()
     items: list[dict] = []
     seen_ids: set[int] = set()
     # ComicVine expose mal le filtrage par publisher sur /characters, donc on scanne
     # plusieurs pages triées par popularité puis on filtre localement.
-    scan_limit = max(max_items * 6, 600)
+    scan_limit = max(max_items * 3, 200)
     for offset in range(0, scan_limit, 100):
         params = {
             "sort": "count_of_issue_appearances:desc",
@@ -5895,6 +5897,8 @@ async def _cv_fetch_character_pool(publisher_id: int, max_items: int = 180) -> l
     for index, item in enumerate(items):
         item["rarity"] = _gacha_rarity_for_index(index, len(items))
 
+    duration = round(datetime.utcnow().timestamp() - started_at, 2)
+    print(f"ℹ️ Gacha pool { _publisher_meta(publisher_id)['name'] }: {len(items)} personnages chargés en {duration}s")
     cv_character_pool_cache[publisher_id] = {"ts": now_ts, "items": items}
     return items
 
@@ -6205,7 +6209,13 @@ async def slash_gacha_pull(interaction: discord.Interaction, univers: str):
         )
         return
 
-    pool = await _cv_fetch_character_pool(publisher_id)
+    try:
+        pool = await asyncio.wait_for(_cv_fetch_character_pool(publisher_id), timeout=12)
+    except asyncio.TimeoutError:
+        await interaction.followup.send(
+            f"❌ Le pool gacha {meta['name']} met trop de temps à charger pour le moment. Réessaie dans quelques secondes."
+        )
+        return
     if not pool:
         await interaction.followup.send(f"❌ Impossible de charger le pool gacha {meta['name']} pour le moment.")
         return
