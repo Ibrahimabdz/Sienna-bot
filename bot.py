@@ -34,10 +34,11 @@ except ImportError:
     print("⚠️  levelup_card.py introuvable — GIF level-up désactivé")
 
 try:
-    from akinator.async_client import AsyncAkinator, THEME_IDS
+    from akinator.async_client import AsyncAkinator, AsyncCloudScraper, THEME_IDS
     AKINATOR_ENABLED = True
 except ImportError:
     AsyncAkinator = None
+    AsyncCloudScraper = None
     THEME_IDS = {}
     AKINATOR_ENABLED = False
     print("⚠️  akinator non installé — /jeu akinator désactivé")
@@ -483,6 +484,27 @@ def _akinator_theme_label(theme: str) -> str:
     return {"c": "Personnage", "a": "Animal", "o": "Objet"}.get(theme, "Personnage")
 
 
+def _make_akinator_client() -> AsyncAkinator:
+    session = AsyncCloudScraper(
+        browser={"browser": "chrome", "platform": "windows", "desktop": True}
+    )
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/133.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    scraper = getattr(session, "scraper", None)
+    if scraper:
+        scraper.headers.update(headers)
+    return AsyncAkinator(session=session)
+
+
 async def _akinator_post(aki: AsyncAkinator, endpoint: str, data: dict, *, allow_redirects: bool = False):
     response = await aki.session.post(
         f"https://{aki.language}.akinator.com/{endpoint}",
@@ -509,9 +531,25 @@ async def _start_akinator_game(aki: AsyncAkinator, theme: str, *, child_mode: bo
                 aki.theme = theme
                 aki.language = language
                 aki.child_mode = child_mode
+                headers = {
+                    "Origin": f"https://{language}.akinator.com",
+                    "Referer": f"https://{language}.akinator.com/",
+                    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+                }
+                scraper = getattr(aki.session, "scraper", None)
+                if scraper:
+                    scraper.headers.update(headers)
+                    await asyncio.to_thread(
+                        scraper.get,
+                        f"https://{language}.akinator.com/",
+                        headers=headers,
+                        timeout=20,
+                        allow_redirects=True,
+                    )
                 response = await aki.session.post(
                     f"https://{language}.akinator.com/game",
                     data={"sid": THEME_IDS[theme], "cm": str(child_mode).lower()},
+                    headers=headers,
                 )
                 response.raise_for_status()
                 text = response.text
@@ -552,7 +590,9 @@ async def _start_akinator_game(aki: AsyncAkinator, theme: str, *, child_mode: bo
     raise RuntimeError(" ; ".join(errors[-4:]) or "Échec du démarrage Akinator")
 
 
-def _format_akinator_user_error(action: str) -> str:
+def _format_akinator_user_error(action: str, error: Exception | None = None) -> str:
+    if error and "403" in str(error):
+        return f"❌ Akinator bloque actuellement la connexion du bot pendant {action}. Réessaie plus tard."
     return f"❌ Akinator est indisponible pour le moment pendant {action}. Réessaie dans quelques secondes."
 
 
@@ -752,7 +792,7 @@ class AkinatorQuestionView(discord.ui.View):
             print(f"⚠️ Akinator answer error: {exc}")
             await _cleanup_akinator_session(self.user_id, self.token)
             await interaction.response.edit_message(
-                content=_format_akinator_user_error("la partie"),
+                content=_format_akinator_user_error("la partie", exc),
                 embed=None,
                 view=None,
             )
@@ -821,7 +861,7 @@ class AkinatorQuestionView(discord.ui.View):
         except Exception as exc:
             print(f"⚠️ Akinator back error: {exc}")
             await _cleanup_akinator_session(self.user_id, self.token)
-            await interaction.response.edit_message(content=_format_akinator_user_error("le retour arrière"), embed=None, view=None)
+            await interaction.response.edit_message(content=_format_akinator_user_error("le retour arrière", exc), embed=None, view=None)
             return
         new_view = AkinatorQuestionView(self.user_id, self.token)
         new_view.message = interaction.message
@@ -877,7 +917,7 @@ class AkinatorGuessView(discord.ui.View):
         except Exception as exc:
             print(f"⚠️ Akinator confirm error: {exc}")
             await _cleanup_akinator_session(self.user_id, self.token)
-            await interaction.response.edit_message(content=_format_akinator_user_error("la validation"), embed=None, view=None)
+            await interaction.response.edit_message(content=_format_akinator_user_error("la validation", exc), embed=None, view=None)
             return
         await _cleanup_akinator_session(self.user_id, self.token)
         await interaction.response.edit_message(embed=_akinator_finished_embed(interaction.user, aki), view=None)
@@ -896,7 +936,7 @@ class AkinatorGuessView(discord.ui.View):
         except Exception as exc:
             print(f"⚠️ Akinator deny error: {exc}")
             await _cleanup_akinator_session(self.user_id, self.token)
-            await interaction.response.edit_message(content=_format_akinator_user_error("la relance"), embed=None, view=None)
+            await interaction.response.edit_message(content=_format_akinator_user_error("la relance", exc), embed=None, view=None)
             return
 
         new_view = AkinatorQuestionView(self.user_id, self.token)
@@ -1019,11 +1059,6 @@ def _message_interaction_name(message: discord.Message) -> str:
     interaction_meta = getattr(message, "interaction_metadata", None)
     if interaction_meta:
         name = getattr(interaction_meta, "name", "") or ""
-        if name:
-            return str(name).lower()
-    interaction = getattr(message, "interaction", None)
-    if interaction:
-        name = getattr(interaction, "name", "") or ""
         if name:
             return str(name).lower()
     return ""
@@ -2040,12 +2075,12 @@ async def slash_akinator(interaction: discord.Interaction, theme: str = "personn
         await _cleanup_akinator_session(interaction.user.id)
 
     await interaction.response.defer()
-    aki = AsyncAkinator()
+    aki = _make_akinator_client()
     try:
         await _start_akinator_game(aki, AKINATOR_THEMES.get(theme, "c"))
     except Exception as exc:
         print(f"⚠️ Akinator startup error: {exc}")
-        await interaction.followup.send(_format_akinator_user_error("le démarrage"), ephemeral=True)
+        await interaction.followup.send(_format_akinator_user_error("le démarrage", exc), ephemeral=True)
         await _cleanup_akinator_session(interaction.user.id)
         return
 
