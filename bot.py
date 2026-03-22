@@ -6,11 +6,9 @@ import os
 import random
 import asyncio
 import re
-from html import unescape
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import json
-from types import SimpleNamespace
 
 # Import du générateur de carte stats
 try:
@@ -33,16 +31,6 @@ try:
 except ImportError:
     LEVELUP_GIF_ENABLED = False
     print("⚠️  levelup_card.py introuvable — GIF level-up désactivé")
-
-try:
-    from akinator.async_client import AsyncAkinator, AsyncCloudScraper, THEME_IDS
-    AKINATOR_ENABLED = True
-except ImportError:
-    AsyncAkinator = None
-    AsyncCloudScraper = None
-    THEME_IDS = {}
-    AKINATOR_ENABLED = False
-    print("⚠️  akinator non installé — /jeu akinator désactivé")
 
 load_dotenv()
 
@@ -227,9 +215,6 @@ def load_data():
 #  ⚙️  [1] CONFIGURATION & VARIABLES
 # ════════════════════════════════════════════════════════════════
 TOKEN                  = os.getenv("DISCORD_TOKEN", "VOTRE_TOKEN_ICI")
-AKINATOR_SERVICE_URL   = os.getenv("AKINATOR_SERVICE_URL", "").rstrip("/")
-AKINATOR_SERVICE_TOKEN = os.getenv("AKINATOR_SERVICE_TOKEN", "")
-AKINATOR_SERVICE_TIMEOUT = int(os.getenv("AKINATOR_SERVICE_TIMEOUT", "25"))
 WELCOME_CHANNEL_ID     = int(os.getenv("WELCOME_CHANNEL_ID", 0))
 GOODBYE_CHANNEL_ID     = int(os.getenv("GOODBYE_CHANNEL_ID", 0))
 FREE_GAMES_CHANNEL_ID  = int(os.getenv("FREE_GAMES_CHANNEL_ID", 0))
@@ -307,13 +292,6 @@ DISABLED_SLASH_COMMANDS = [
     "lgstatus",
     "lgarreter",
 ]
-AKINATOR_THEMES = {
-    "personnage": "c",
-    "animal": "a",
-    "objet": "o",
-}
-akinator_sessions: dict[int, dict] = {}
-akinator_session_counter = 0
 
 # ════════════════════════════════════════════════════════════════
 #  🤖  [2] INTENTS & BOT
@@ -452,613 +430,6 @@ async def _create_or_update_custom_role(member: discord.Member, role_name: str, 
     save_data()
     return role, created
 
-
-def _next_akinator_session_token() -> int:
-    global akinator_session_counter
-    akinator_session_counter += 1
-    return akinator_session_counter
-
-
-def _get_akinator_session(user_id: int, token: int | None = None) -> dict | None:
-    session = akinator_sessions.get(user_id)
-    if not session:
-        return None
-    if token is not None and int(session.get("token", 0)) != int(token):
-        return None
-    return session
-
-
-async def _cleanup_akinator_session(user_id: int, token: int | None = None):
-    session = _get_akinator_session(user_id, token)
-    if not session:
-        return
-    akinator_sessions.pop(user_id, None)
-    aki = session.get("aki")
-    if aki and _is_remote_akinator(aki):
-        try:
-            await _akinator_remote_request("/close", {"session_id": aki._remote_session_id})
-        except Exception:
-            pass
-        return
-    close_method = getattr(getattr(aki, "session", None), "close", None)
-    if not close_method:
-        return
-    try:
-        maybe_coro = close_method()
-        if asyncio.iscoroutine(maybe_coro):
-            await maybe_coro
-    except Exception:
-        pass
-
-
-def _akinator_theme_label(theme: str) -> str:
-    return {"c": "Personnage", "a": "Animal", "o": "Objet"}.get(theme, "Personnage")
-
-
-def _akinator_use_remote_service() -> bool:
-    return bool(AKINATOR_SERVICE_URL)
-
-
-def _akinator_remote_headers() -> dict:
-    headers = {"Content-Type": "application/json"}
-    if AKINATOR_SERVICE_TOKEN:
-        headers["Authorization"] = f"Bearer {AKINATOR_SERVICE_TOKEN}"
-    return headers
-
-
-def _is_remote_akinator(aki) -> bool:
-    return bool(getattr(aki, "_remote_session_id", ""))
-
-
-def _remote_akinator_state_to_obj(payload: dict):
-    state = payload.get("state", payload)
-    aki = SimpleNamespace()
-    for key, value in state.items():
-        setattr(aki, key, value)
-    if payload.get("session_id"):
-        setattr(aki, "_remote_session_id", payload["session_id"])
-    return aki
-
-
-def _update_remote_akinator_state(aki, payload: dict):
-    state = payload.get("state", payload)
-    for key, value in state.items():
-        setattr(aki, key, value)
-    if payload.get("session_id"):
-        setattr(aki, "_remote_session_id", payload["session_id"])
-    return aki
-
-
-async def _akinator_remote_request(path: str, payload: dict | None = None, *, method: str = "POST") -> dict:
-    if not _akinator_use_remote_service():
-        raise RuntimeError("Service Akinator distant non configuré.")
-    timeout = aiohttp.ClientTimeout(total=AKINATOR_SERVICE_TIMEOUT)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.request(
-            method,
-            f"{AKINATOR_SERVICE_URL}{path}",
-            headers=_akinator_remote_headers(),
-            json=payload,
-        ) as response:
-            if response.status >= 400:
-                body = await response.text()
-                raise RuntimeError(f"Akinator service HTTP {response.status}: {body[:200]}")
-            if response.content_type == "application/json":
-                return await response.json()
-            text = await response.text()
-            return {"raw": text}
-
-
-def _make_akinator_client(browser_platform: str | None = None) -> AsyncAkinator:
-    browser_platform = browser_platform or ("windows" if os.name == "nt" else "linux")
-    if browser_platform == "linux":
-        user_agent = (
-            "Mozilla/5.0 (X11; Linux x86_64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/133.0.0.0 Safari/537.36"
-        )
-    else:
-        user_agent = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/133.0.0.0 Safari/537.36"
-        )
-    session = AsyncCloudScraper(
-        browser={"browser": "chrome", "platform": browser_platform, "desktop": True}
-    )
-    headers = {
-        "User-Agent": user_agent,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-    scraper = getattr(session, "scraper", None)
-    if scraper:
-        scraper.headers.update(headers)
-    return AsyncAkinator(session=session)
-
-
-def _reset_akinator_state(aki: AsyncAkinator):
-    aki.progression = 0
-    aki.step = 0
-    aki.akitude = "defi.png"
-    aki.finished = False
-    aki.win = False
-    aki.step_last_proposition = ""
-    aki.id_proposition = None
-    aki.name_proposition = None
-    aki.description_proposition = None
-    aki.flag_photo = None
-    aki.photo = None
-
-
-async def _akinator_post(aki: AsyncAkinator, endpoint: str, data: dict, *, allow_redirects: bool = False):
-    response = await aki.session.post(
-        f"https://{aki.language}.akinator.com/{endpoint}",
-        data=data,
-        allow_redirects=allow_redirects,
-    )
-    response.raise_for_status()
-    return response
-
-
-def _extract_akinator_value(patterns: list[str], text: str) -> str:
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.S)
-        if match:
-            return unescape(match.group(1)).strip()
-    return ""
-
-
-async def _start_akinator_game(aki: AsyncAkinator, theme: str, *, child_mode: bool = False):
-    errors: list[str] = []
-
-    async def _start_native(target: AsyncAkinator, language: str):
-        await asyncio.wait_for(
-            target.start_game(language=language, child_mode=child_mode, theme=theme),
-            timeout=20,
-        )
-        _reset_akinator_state(target)
-
-    async def _start_legacy(target: AsyncAkinator, language: str):
-        target.theme = theme
-        target.language = language
-        target.child_mode = child_mode
-        headers = {
-            "Origin": f"https://{language}.akinator.com",
-            "Referer": f"https://{language}.akinator.com/",
-            "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-        }
-        scraper = getattr(target.session, "scraper", None)
-        if scraper:
-            scraper.headers.update(headers)
-            await asyncio.to_thread(
-                scraper.get,
-                f"https://{language}.akinator.com/",
-                headers=headers,
-                timeout=20,
-                allow_redirects=True,
-            )
-        response = await target.session.post(
-            f"https://{language}.akinator.com/game",
-            data={"sid": THEME_IDS[theme], "cm": str(child_mode).lower()},
-            headers=headers,
-            timeout=20,
-        )
-        response.raise_for_status()
-        text = response.text
-
-        target.session_id = _extract_akinator_value([r"#session'\)\.val\('(.+?)'\)"], text)
-        target.signature = _extract_akinator_value([r"#signature'\)\.val\('(.+?)'\)"], text)
-        target.identifiant = _extract_akinator_value([r"#identifiant'\)\.val\('(.+?)'\)"], text)
-        target.question = _extract_akinator_value(
-            [
-                r'<p class="question-text" id="question-label">(.+?)</p>',
-                r'<div class="bubble-body">\s*<p[^>]*id="question-label"[^>]*>(.+?)</p>',
-            ],
-            text,
-        )
-        if not all([target.session_id, target.signature, target.identifiant, target.question]):
-            raise RuntimeError("Réponse de démarrage incomplète")
-        target.proposition = _extract_akinator_value([r'<p id="p-sub-bubble">(.+?)</p>'], text)
-        _reset_akinator_state(target)
-
-    platform_order = [("windows" if os.name == "nt" else "linux")]
-    alternate_platform = "linux" if platform_order[0] == "windows" else "windows"
-    platform_order.append(alternate_platform)
-
-    for browser_platform in platform_order:
-        for language in ("fr", "en"):
-            for strategy_name, strategy in (("native", _start_native), ("legacy", _start_legacy)):
-                try:
-                    fresh_client = _make_akinator_client(browser_platform)
-                    aki.session = fresh_client.session
-                    await strategy(aki, language)
-                    print(f"ℹ️ Akinator startup OK via {strategy_name} ({browser_platform}/{language})")
-                    return
-                except Exception as exc:
-                    errors.append(f"{strategy_name}:{browser_platform}:{language}:{exc!r}")
-                    await asyncio.sleep(0.5)
-    raise RuntimeError(" ; ".join(errors) or "Échec du démarrage Akinator")
-
-
-def _format_akinator_user_error(action: str, error: Exception | None = None) -> str:
-    if error and "403" in str(error):
-        return f"❌ Akinator a refusé la session pendant {action}. Réessaie dans quelques secondes."
-    return f"❌ Akinator est indisponible pour le moment pendant {action}. Réessaie dans quelques secondes."
-
-
-def _akinator_apply_payload(aki: AsyncAkinator, payload: dict):
-    aki.completion = payload.get("completion", getattr(aki, "completion", None))
-    if aki.completion == "KO - TIMEOUT":
-        raise RuntimeError("La session Akinator a expiré. Relance `/jeu akinator`.")
-
-    if "id_proposition" in payload:
-        aki.win = True
-        aki.finished = False
-        aki.id_proposition = payload.get("id_proposition")
-        aki.name_proposition = payload.get("name_proposition", "Inconnu")
-        aki.description_proposition = payload.get("description_proposition", "")
-        aki.pseudo = payload.get("pseudo")
-        aki.flag_photo = payload.get("flag_photo")
-        aki.photo = payload.get("photo")
-        if "step" in payload:
-            aki.step = int(float(payload["step"]))
-        if "progression" in payload:
-            aki.progression = float(payload["progression"])
-        return
-
-    aki.win = False
-    aki.finished = False
-    aki.id_proposition = None
-    aki.name_proposition = None
-    aki.description_proposition = None
-    aki.flag_photo = None
-    aki.photo = None
-    if "step" in payload:
-        aki.step = int(float(payload["step"]))
-    if "progression" in payload:
-        aki.progression = float(payload["progression"])
-    if "question" in payload:
-        aki.question = payload["question"]
-    if "akitude" in payload:
-        aki.akitude = payload["akitude"]
-
-
-async def _akinator_answer(aki: AsyncAkinator, answer: str):
-    if _is_remote_akinator(aki):
-        payload = await _akinator_remote_request(
-            "/answer",
-            {"session_id": aki._remote_session_id, "answer": answer},
-        )
-        _update_remote_akinator_state(aki, payload)
-        return payload
-
-    if aki.win:
-        if answer == "yes":
-            response = await _akinator_post(
-                aki,
-                "choice",
-                {
-                    "step": aki.step,
-                    "sid": THEME_IDS[aki.theme],
-                    "session": aki.session_id,
-                    "signature": aki.signature,
-                    "identifiant": aki.identifiant,
-                    "pid": aki.id_proposition,
-                    "charac_name": aki.name_proposition,
-                    "charac_description": aki.description_proposition,
-                    "pflag_photo": aki.flag_photo or "",
-                },
-                allow_redirects=True,
-            )
-            aki.finished = True
-            aki.win = True
-            aki.progression = 100
-            return response
-        if answer == "no":
-            return await _akinator_back(aki)
-        raise ValueError("Après une proposition, réponds seulement par oui ou non.")
-
-    answer_map = {
-        "yes": 0,
-        "no": 1,
-        "idk": 2,
-        "probably": 3,
-        "probably_not": 4,
-    }
-    if answer not in answer_map:
-        raise ValueError("Réponse Akinator invalide.")
-
-    response = await _akinator_post(
-        aki,
-        "answer",
-        {
-            "step": aki.step,
-            "progression": aki.progression,
-            "sid": THEME_IDS[aki.theme],
-            "cm": str(aki.child_mode).lower(),
-            "answer": answer_map[answer],
-            "step_last_proposition": getattr(aki, "step_last_proposition", ""),
-            "session": aki.session_id,
-            "signature": aki.signature,
-        },
-    )
-    payload = response.json()
-    _akinator_apply_payload(aki, payload)
-    return payload
-
-
-async def _akinator_back(aki: AsyncAkinator):
-    if _is_remote_akinator(aki):
-        payload = await _akinator_remote_request(
-            "/back",
-            {"session_id": aki._remote_session_id},
-        )
-        _update_remote_akinator_state(aki, payload)
-        return payload
-
-    if int(getattr(aki, "step", 0) or 0) <= 0:
-        raise ValueError("Tu es déjà à la première question.")
-    aki.win = False
-    response = await _akinator_post(
-        aki,
-        "cancel_answer",
-        {
-            "step": aki.step,
-            "progression": aki.progression,
-            "sid": THEME_IDS[aki.theme],
-            "cm": str(aki.child_mode).lower(),
-            "session": aki.session_id,
-            "signature": aki.signature,
-        },
-    )
-    payload = response.json()
-    _akinator_apply_payload(aki, payload)
-    return payload
-
-
-def _akinator_question_embed(user: discord.abc.User, aki: AsyncAkinator) -> discord.Embed:
-    embed = discord.Embed(
-        title="🧠 Akinator",
-        description=aki.question or "Question indisponible.",
-        color=0xF1C40F,
-        timestamp=datetime.utcnow(),
-    )
-    embed.add_field(name="🎯 Thème", value=_akinator_theme_label(aki.theme), inline=True)
-    embed.add_field(name="📈 Progression", value=f"{float(getattr(aki, 'progression', 0) or 0):.1f}%", inline=True)
-    embed.add_field(name="🔢 Question", value=str(int(getattr(aki, 'step', 0) or 0) + 1), inline=True)
-    embed.set_footer(text=f"Partie de {user.display_name}")
-    return embed
-
-
-def _akinator_guess_embed(user: discord.abc.User, aki: AsyncAkinator) -> discord.Embed:
-    embed = discord.Embed(
-        title="🤔 Je pense avoir trouvé",
-        description=f"Je pense à **{getattr(aki, 'name_proposition', 'Inconnu')}**.",
-        color=0x57F287,
-        timestamp=datetime.utcnow(),
-    )
-    description = getattr(aki, "description_proposition", "") or "Pas de description disponible."
-    embed.add_field(name="📚 Description", value=description[:1024], inline=False)
-    embed.add_field(name="❓ C'est bien ça ?", value="Réponds avec les boutons ci-dessous.", inline=False)
-    photo = getattr(aki, "photo", None)
-    if photo:
-        embed.set_thumbnail(url=photo)
-    embed.set_footer(text=f"Partie de {user.display_name}")
-    return embed
-
-
-def _akinator_has_guess(aki: AsyncAkinator) -> bool:
-    return bool(getattr(aki, "win", False) and getattr(aki, "name_proposition", None))
-
-
-def _akinator_finished_embed(user: discord.abc.User, aki: AsyncAkinator) -> discord.Embed:
-    embed = discord.Embed(
-        title="✅ Akinator terminé",
-        description=f"J'avais bien trouvé **{getattr(aki, 'name_proposition', 'Inconnu')}**.",
-        color=0x57F287,
-        timestamp=datetime.utcnow(),
-    )
-    description = getattr(aki, "description_proposition", "") or "Pas de description disponible."
-    embed.add_field(name="📚 Résultat", value=description[:1024], inline=False)
-    photo = getattr(aki, "photo", None)
-    if photo:
-        embed.set_thumbnail(url=photo)
-    embed.set_footer(text=f"Partie de {user.display_name}")
-    return embed
-
-
-class AkinatorQuestionView(discord.ui.View):
-    def __init__(self, user_id: int, token: int):
-        super().__init__(timeout=240)
-        self.user_id = user_id
-        self.token = token
-        self.message: discord.Message | None = None
-
-    async def _interaction_check(self, interaction: discord.Interaction) -> bool:
-        session = _get_akinator_session(self.user_id, self.token)
-        if not session:
-            await interaction.response.send_message("❌ Cette partie Akinator n'est plus active.", ephemeral=True)
-            return False
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ Cette partie ne t'appartient pas.", ephemeral=True)
-            return False
-        return True
-
-    async def _handle_answer(self, interaction: discord.Interaction, answer: str):
-        if not await self._interaction_check(interaction):
-            return
-        session = _get_akinator_session(self.user_id, self.token)
-        if not session:
-            await interaction.response.send_message("❌ Cette partie Akinator n'est plus active.", ephemeral=True)
-            return
-        aki = session["aki"]
-        try:
-            await _akinator_answer(aki, answer)
-        except Exception as exc:
-            print(f"⚠️ Akinator answer error: {exc}")
-            await _cleanup_akinator_session(self.user_id, self.token)
-            await interaction.response.edit_message(
-                content=_format_akinator_user_error("la partie", exc),
-                embed=None,
-                view=None,
-            )
-            return
-
-        if getattr(aki, "finished", False):
-            await _cleanup_akinator_session(self.user_id, self.token)
-            await interaction.response.edit_message(embed=_akinator_finished_embed(interaction.user, aki), view=None)
-            return
-
-        if _akinator_has_guess(aki):
-            guess_view = AkinatorGuessView(self.user_id, self.token)
-            guess_view.message = interaction.message
-            await interaction.response.edit_message(embed=_akinator_guess_embed(interaction.user, aki), view=guess_view)
-            return
-
-        new_view = AkinatorQuestionView(self.user_id, self.token)
-        new_view.message = interaction.message
-        await interaction.response.edit_message(embed=_akinator_question_embed(interaction.user, aki), view=new_view)
-
-    async def on_timeout(self):
-        if not _get_akinator_session(self.user_id, self.token):
-            return
-        await _cleanup_akinator_session(self.user_id, self.token)
-        if not self.message:
-            return
-        try:
-            await self.message.edit(content="⌛ La partie Akinator a expiré.", embed=None, view=None)
-        except discord.HTTPException:
-            pass
-
-    @discord.ui.button(label="Oui", style=discord.ButtonStyle.success, row=0)
-    async def yes(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._handle_answer(interaction, "yes")
-
-    @discord.ui.button(label="Non", style=discord.ButtonStyle.danger, row=0)
-    async def no(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._handle_answer(interaction, "no")
-
-    @discord.ui.button(label="Je sais pas", style=discord.ButtonStyle.secondary, row=0)
-    async def idk(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._handle_answer(interaction, "idk")
-
-    @discord.ui.button(label="Probablement", style=discord.ButtonStyle.primary, row=1)
-    async def probably(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._handle_answer(interaction, "probably")
-
-    @discord.ui.button(label="Probablement pas", style=discord.ButtonStyle.primary, row=1)
-    async def probably_not(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await self._handle_answer(interaction, "probably_not")
-
-    @discord.ui.button(label="Retour", style=discord.ButtonStyle.secondary, row=2)
-    async def back(self, interaction: discord.Interaction, _: discord.ui.Button):
-        if not await self._interaction_check(interaction):
-            return
-        session = _get_akinator_session(self.user_id, self.token)
-        if not session:
-            await interaction.response.send_message("❌ Cette partie Akinator n'est plus active.", ephemeral=True)
-            return
-        aki = session["aki"]
-        try:
-            await _akinator_back(aki)
-        except ValueError as exc:
-            await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
-            return
-        except Exception as exc:
-            print(f"⚠️ Akinator back error: {exc}")
-            await _cleanup_akinator_session(self.user_id, self.token)
-            await interaction.response.edit_message(content=_format_akinator_user_error("le retour arrière", exc), embed=None, view=None)
-            return
-        new_view = AkinatorQuestionView(self.user_id, self.token)
-        new_view.message = interaction.message
-        await interaction.response.edit_message(embed=_akinator_question_embed(interaction.user, aki), view=new_view)
-
-    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, row=2)
-    async def stop(self, interaction: discord.Interaction, _: discord.ui.Button):
-        if not await self._interaction_check(interaction):
-            return
-        await _cleanup_akinator_session(self.user_id, self.token)
-        await interaction.response.edit_message(content="🛑 Partie Akinator arrêtée.", embed=None, view=None)
-
-
-class AkinatorGuessView(discord.ui.View):
-    def __init__(self, user_id: int, token: int):
-        super().__init__(timeout=180)
-        self.user_id = user_id
-        self.token = token
-        self.message: discord.Message | None = None
-
-    async def _interaction_check(self, interaction: discord.Interaction) -> bool:
-        session = _get_akinator_session(self.user_id, self.token)
-        if not session:
-            await interaction.response.send_message("❌ Cette partie Akinator n'est plus active.", ephemeral=True)
-            return False
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ Cette partie ne t'appartient pas.", ephemeral=True)
-            return False
-        return True
-
-    async def on_timeout(self):
-        if not _get_akinator_session(self.user_id, self.token):
-            return
-        await _cleanup_akinator_session(self.user_id, self.token)
-        if not self.message:
-            return
-        try:
-            await self.message.edit(content="⌛ La partie Akinator a expiré.", embed=None, view=None)
-        except discord.HTTPException:
-            pass
-
-    @discord.ui.button(label="Oui, c'est ça", style=discord.ButtonStyle.success)
-    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button):
-        if not await self._interaction_check(interaction):
-            return
-        session = _get_akinator_session(self.user_id, self.token)
-        if not session:
-            await interaction.response.send_message("❌ Cette partie Akinator n'est plus active.", ephemeral=True)
-            return
-        aki = session["aki"]
-        try:
-            await _akinator_answer(aki, "yes")
-        except Exception as exc:
-            print(f"⚠️ Akinator confirm error: {exc}")
-            await _cleanup_akinator_session(self.user_id, self.token)
-            await interaction.response.edit_message(content=_format_akinator_user_error("la validation", exc), embed=None, view=None)
-            return
-        await _cleanup_akinator_session(self.user_id, self.token)
-        await interaction.response.edit_message(embed=_akinator_finished_embed(interaction.user, aki), view=None)
-
-    @discord.ui.button(label="Non, continue", style=discord.ButtonStyle.primary)
-    async def deny(self, interaction: discord.Interaction, _: discord.ui.Button):
-        if not await self._interaction_check(interaction):
-            return
-        session = _get_akinator_session(self.user_id, self.token)
-        if not session:
-            await interaction.response.send_message("❌ Cette partie Akinator n'est plus active.", ephemeral=True)
-            return
-        aki = session["aki"]
-        try:
-            await _akinator_answer(aki, "no")
-        except Exception as exc:
-            print(f"⚠️ Akinator deny error: {exc}")
-            await _cleanup_akinator_session(self.user_id, self.token)
-            await interaction.response.edit_message(content=_format_akinator_user_error("la relance", exc), embed=None, view=None)
-            return
-
-        new_view = AkinatorQuestionView(self.user_id, self.token)
-        new_view.message = interaction.message
-        await interaction.response.edit_message(embed=_akinator_question_embed(interaction.user, aki), view=new_view)
-
-    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger)
-    async def stop(self, interaction: discord.Interaction, _: discord.ui.Button):
-        if not await self._interaction_check(interaction):
-            return
-        await _cleanup_akinator_session(self.user_id, self.token)
-        await interaction.response.edit_message(content="🛑 Partie Akinator arrêtée.", embed=None, view=None)
-
 def get_stats_for_days(user_id: int, days: int) -> dict:
     """Calcule msgs et heures vocales sur N derniers jours."""
     d   = get_user_data(user_id)
@@ -1121,6 +492,212 @@ async def send_log(guild: discord.Guild, embed: discord.Embed):
             await ch.send(embed=embed)
         except Exception:
             pass
+
+def _truncate(text: str | None, limit: int = 1024) -> str:
+    value = (text or "").strip()
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 3)] + "..."
+
+def _codeblock(text: str | None, limit: int = 980) -> str:
+    value = (text or "").replace("```", "'''").strip()
+    if not value:
+        value = "*vide*"
+    return f"```{_truncate(value, limit)}```"
+
+def _format_bytes(size: int | None) -> str:
+    value = int(size or 0)
+    units = ["o", "Ko", "Mo", "Go"]
+    amount = float(value)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            if unit == "o":
+                return f"{int(amount)} {unit}"
+            return f"{amount:.1f} {unit}"
+        amount /= 1024
+    return f"{value} o"
+
+def _format_attachment_lines(attachments, limit: int = 1024) -> str:
+    lines = []
+    for attachment in attachments[:8]:
+        content_type = getattr(attachment, "content_type", None)
+        extras = [f"taille {_format_bytes(getattr(attachment, 'size', 0))}"]
+        if content_type:
+            extras.append(content_type)
+        lines.append(f"• [{attachment.filename}]({attachment.url}) ({' • '.join(extras)})")
+    if len(attachments) > 8:
+        lines.append(f"• +{len(attachments) - 8} autre(s) fichier(s)")
+    return _truncate("\n".join(lines), limit)
+
+def _format_embed_lines(embeds, limit: int = 1024) -> str:
+    lines = []
+    for index, item in enumerate(embeds[:5], start=1):
+        preview = item.title or item.description or item.type or "embed"
+        preview = re.sub(r"\s+", " ", preview).strip()
+        lines.append(f"• #{index} {_truncate(preview, 140)}")
+    if len(embeds) > 5:
+        lines.append(f"• +{len(embeds) - 5} autre(s) embed(s)")
+    return _truncate("\n".join(lines), limit)
+
+def _format_permissions(role: discord.Role, limit: int = 1024) -> str:
+    allowed = [name.replace("_", " ") for name, enabled in role.permissions if enabled]
+    if not allowed:
+        return "Aucune permission"
+    preview = ", ".join(allowed[:12])
+    if len(allowed) > 12:
+        preview += f" (+{len(allowed) - 12})"
+    return _truncate(preview, limit)
+
+def _message_channel_label(channel) -> str:
+    if not channel:
+        return "Inconnu"
+    parts = []
+    mention = getattr(channel, "mention", None)
+    if mention:
+        parts.append(mention)
+    else:
+        name = getattr(channel, "name", "inconnu")
+        parts.append(f"`{name}`")
+    channel_id = getattr(channel, "id", None)
+    if channel_id:
+        parts.append(f"`{channel_id}`")
+    parent = getattr(channel, "parent", None)
+    if parent:
+        parts.append(f"parent {getattr(parent, 'mention', '#' + parent.name)}")
+    category = getattr(channel, "category", None)
+    if category:
+        parts.append(f"catégorie `{category.name}`")
+    return " • ".join(parts)
+
+def _first_image_attachment(message: discord.Message) -> str | None:
+    for attachment in getattr(message, "attachments", []):
+        content_type = getattr(attachment, "content_type", "") or ""
+        if content_type.startswith("image"):
+            return attachment.proxy_url or attachment.url
+    return None
+
+def _bool_label(value: bool) -> str:
+    return "Oui" if value else "Non"
+
+def _describe_permission_changes(before: discord.Role, after: discord.Role, limit: int = 1024) -> str:
+    changes = []
+    before_map = dict(before.permissions)
+    after_map = dict(after.permissions)
+    for key in sorted(set(before_map) | set(after_map)):
+        previous = before_map.get(key, False)
+        current = after_map.get(key, False)
+        if previous == current:
+            continue
+        state = "activée" if current else "retirée"
+        changes.append(f"• {key.replace('_', ' ')}: {state}")
+    if not changes:
+        return "Aucun changement détecté"
+    return _truncate("\n".join(changes), limit)
+
+def _voice_state_flags(state: discord.VoiceState) -> list[str]:
+    flags = []
+    if state.self_mute:
+        flags.append("self-mute")
+    if state.self_deaf:
+        flags.append("self-deaf")
+    if state.mute:
+        flags.append("mute staff")
+    if state.deaf:
+        flags.append("deaf staff")
+    if state.self_stream:
+        flags.append("stream")
+    if state.self_video:
+        flags.append("camera")
+    if getattr(state, "suppress", False):
+        flags.append("suppressed")
+    return flags
+
+def _format_emoji_lines(emojis, limit: int = 1024) -> str:
+    lines = []
+    for emoji in list(emojis)[:10]:
+        marker = "animé" if getattr(emoji, "animated", False) else "statique"
+        lines.append(f"• {emoji} `:{emoji.name}:` (`{emoji.id}` • {marker})")
+    if len(emojis) > 10:
+        lines.append(f"• +{len(emojis) - 10} autre(s)")
+    return _truncate("\n".join(lines), limit)
+
+def _format_sticker_lines(stickers, limit: int = 1024) -> str:
+    lines = []
+    for sticker in list(stickers)[:10]:
+        lines.append(f"• `{sticker.name}` (`{sticker.id}` • {getattr(sticker, 'format', 'inconnu')})")
+    if len(stickers) > 10:
+        lines.append(f"• +{len(stickers) - 10} autre(s)")
+    return _truncate("\n".join(lines), limit)
+
+def _describe_overwrite_changes(before, after, limit: int = 1024) -> str:
+    before_map = {}
+    after_map = {}
+    for target, overwrite in getattr(before, "overwrites", {}).items():
+        before_map[getattr(target, "id", id(target))] = (target, overwrite)
+    for target, overwrite in getattr(after, "overwrites", {}).items():
+        after_map[getattr(target, "id", id(target))] = (target, overwrite)
+
+    changes = []
+    all_ids = set(before_map) | set(after_map)
+    for target_id in sorted(all_ids):
+        before_item = before_map.get(target_id)
+        after_item = after_map.get(target_id)
+        if before_item and not after_item:
+            target = before_item[0]
+            changes.append(f"• Permissions retirées pour `{getattr(target, 'name', target_id)}`")
+            continue
+        if after_item and not before_item:
+            target = after_item[0]
+            changes.append(f"• Permissions ajoutées pour `{getattr(target, 'name', target_id)}`")
+            continue
+        if before_item[1] == after_item[1]:
+            continue
+        target = after_item[0]
+        changes.append(f"• Permissions modifiées pour `{getattr(target, 'name', target_id)}`")
+    if not changes:
+        return ""
+    return _truncate("\n".join(changes), limit)
+
+async def _find_recent_audit_entry(
+    guild: discord.Guild,
+    action,
+    *,
+    target_id: int | None = None,
+    channel_id: int | None = None,
+    max_age_seconds: int = 20,
+    limit: int = 6,
+):
+    if not guild or action is None:
+        return None
+    now = datetime.utcnow()
+    try:
+        async for entry in guild.audit_logs(limit=limit, action=action):
+            target = getattr(entry, "target", None)
+            if target_id is not None and getattr(target, "id", None) != target_id:
+                continue
+            extra = getattr(entry, "extra", None)
+            audit_channel = getattr(extra, "channel", None)
+            if channel_id is not None and audit_channel and getattr(audit_channel, "id", None) != channel_id:
+                continue
+            created_at = getattr(entry, "created_at", None)
+            if created_at is not None:
+                created_at = created_at.replace(tzinfo=None)
+                if abs((now - created_at).total_seconds()) > max_age_seconds:
+                    continue
+            return entry
+    except Exception:
+        return None
+    return None
+
+def _add_audit_fields(embed: discord.Embed, entry, *, actor_label: str = "👮 Action par"):
+    if not entry:
+        return
+    actor = getattr(entry, "user", None)
+    if actor:
+        embed.add_field(name=actor_label, value=f"{actor.mention} (`{actor.id}`)", inline=True)
+    reason = getattr(entry, "reason", None)
+    if reason:
+        embed.add_field(name="📄 Raison", value=_truncate(reason, 1024), inline=False)
 
 def _message_interaction_user_id(message: discord.Message) -> int:
     interaction_meta = getattr(message, "interaction_metadata", None)
@@ -1485,10 +1062,20 @@ async def on_member_remove(member: discord.Member):
             await ch.send(embed=embed)
     # Log
     roles = [r.mention for r in member.roles if r.name != "@everyone"]
-    log = discord.Embed(title="📤 Membre parti", color=0xED4245, timestamp=datetime.utcnow())
+    kick_entry = await _find_recent_audit_entry(
+        member.guild,
+        getattr(discord.AuditLogAction, "kick", None),
+        target_id=member.id,
+    )
+    log = discord.Embed(
+        title="👢 Membre expulsé" if kick_entry else "📤 Membre parti",
+        color=0xE67E22 if kick_entry else 0xED4245,
+        timestamp=datetime.utcnow(),
+    )
     log.set_thumbnail(url=member.display_avatar.url)
-    log.add_field(name="Membre", value=f"{member} (`{member.id}`)")
+    log.add_field(name="Membre", value=f"{member} (`{member.id}`)", inline=False)
     log.add_field(name="Rôles", value=", ".join(roles) if roles else "Aucun", inline=False)
+    _add_audit_fields(log, kick_entry, actor_label="👮 Expulsé par")
     log.set_footer(text=f"ID : {member.id}")
     await send_log(member.guild, log)
     await update_counters(member.guild)
@@ -1496,67 +1083,137 @@ async def on_member_remove(member: discord.Member):
 async def on_message_delete(message: discord.Message):
     if not message.guild or message.author.bot:
         return
+
+    audit_entry = await _find_recent_audit_entry(
+        message.guild,
+        getattr(discord.AuditLogAction, "message_delete", None),
+        target_id=message.author.id,
+        channel_id=getattr(message.channel, "id", None),
+    )
+
     embed = discord.Embed(title="🗑️ Message supprimé", color=0xFF6B6B, timestamp=datetime.utcnow())
     embed.set_author(name=str(message.author), icon_url=message.author.display_avatar.url)
-    embed.add_field(name="✍️ Auteur",  value=f"{message.author.mention} (`{message.author.id}`)", inline=True)
-    embed.add_field(name="📌 Salon",   value=message.channel.mention, inline=True)
-    embed.add_field(name="🕐 Envoyé",  value=f"<t:{int(message.created_at.timestamp())}:R>", inline=True)
+    embed.add_field(name="✍️ Auteur", value=f"{message.author.mention} (`{message.author.id}`)", inline=True)
+    embed.add_field(name="📌 Salon", value=_message_channel_label(message.channel), inline=False)
+    embed.add_field(name="🕐 Envoyé", value=f"<t:{int(message.created_at.timestamp())}:F>", inline=True)
+    embed.add_field(name="🧾 Message ID", value=f"`{message.id}`", inline=True)
+    if message.edited_at:
+        embed.add_field(name="✏️ Dernière modif", value=f"<t:{int(message.edited_at.timestamp())}:R>", inline=True)
+    if getattr(message, "type", None):
+        embed.add_field(name="🏷️ Type", value=str(message.type), inline=True)
+    if message.reference and getattr(message.reference, "message_id", None):
+        embed.add_field(name="↩️ Réponse à", value=f"`{message.reference.message_id}`", inline=True)
+    if message.mentions or message.role_mentions:
+        mentions_bits = []
+        if message.mentions:
+            mentions_bits.append(f"{len(message.mentions)} membre(s)")
+        if message.role_mentions:
+            mentions_bits.append(f"{len(message.role_mentions)} rôle(s)")
+        embed.add_field(name="🔔 Mentions", value=" • ".join(mentions_bits), inline=True)
     if message.content:
-        contenu = message.content
-        # Tronquer proprement
-        if len(contenu) > 1020:
-            contenu = contenu[:1020] + "..."
-        embed.add_field(name="📝 Contenu", value=f"```{contenu}```", inline=False)
+        embed.add_field(name="📝 Contenu", value=_codeblock(message.content), inline=False)
     if message.embeds:
-        embed.add_field(name="🖼️ Embeds", value=f"{len(message.embeds)} embed(s) dans le message", inline=False)
+        embed.add_field(name="🖼️ Embeds", value=_format_embed_lines(message.embeds), inline=False)
     if message.attachments:
-        att_list = "\n".join(f"• [{a.filename}]({a.url})" for a in message.attachments)
-        embed.add_field(name="📎 Pièces jointes", value=att_list[:1024], inline=False)
-        if message.attachments[0].content_type and message.attachments[0].content_type.startswith("image"):
-            embed.set_image(url=message.attachments[0].proxy_url)
-    if message.reference:
-        embed.add_field(name="↩️ Réponse à", value=f"Message ID `{message.reference.message_id}`", inline=False)
-    # Qui a supprimé (audit log)
-    try:
-        entries = [e async for e in message.guild.audit_logs(limit=1, action=discord.AuditLogAction.message_delete)]
-        if entries and entries[0].target.id == message.author.id:
-            embed.add_field(name="🔨 Supprimé par", value=f"{entries[0].user.mention} (`{entries[0].user.id}`)", inline=False)
-    except Exception:
-        pass
+        embed.add_field(name="📎 Pièces jointes", value=_format_attachment_lines(message.attachments), inline=False)
+    if message.stickers:
+        sticker_lines = [f"• {sticker.name} (`{sticker.id}`)" for sticker in message.stickers[:8]]
+        embed.add_field(name="🏷️ Stickers", value=_truncate("\n".join(sticker_lines), 1024), inline=False)
+    image_url = _first_image_attachment(message)
+    if image_url:
+        embed.set_image(url=image_url)
+    if audit_entry:
+        actor = getattr(audit_entry, "user", None)
+        label = "🔨 Supprimé par" if actor and actor.id != message.author.id else "👮 Action par"
+        _add_audit_fields(embed, audit_entry, actor_label=label)
     embed.set_footer(text=f"Message ID : {message.id} • User ID : {message.author.id}")
     await send_log(message.guild, embed)
 
 
 @bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message):
-    if not before.guild or before.author.bot or before.content == after.content:
+    attachments_changed = len(before.attachments) != len(after.attachments)
+    embeds_changed = len(before.embeds) != len(after.embeds)
+    if not before.guild or before.author.bot or (
+        before.content == after.content and not attachments_changed and not embeds_changed
+    ):
         return
+
     embed = discord.Embed(title="✏️ Message modifié", color=0xFFA500, timestamp=datetime.utcnow())
     embed.set_author(name=str(before.author), icon_url=before.author.display_avatar.url)
     embed.add_field(name="✍️ Auteur", value=f"{before.author.mention} (`{before.author.id}`)", inline=True)
-    embed.add_field(name="📌 Salon",  value=before.channel.mention, inline=True)
-    embed.add_field(name="🕐 Envoyé", value=f"<t:{int(before.created_at.timestamp())}:R>", inline=True)
-    avant = before.content[:512] if before.content else "*vide*"
-    apres = after.content[:512]  if after.content  else "*vide*"
-    embed.add_field(name="📝 Avant", value=f"```{avant}```", inline=False)
-    embed.add_field(name="✅ Après", value=f"```{apres}```", inline=False)
-    embed.add_field(name="🔗 Lien",  value=f"[Aller au message]({after.jump_url})", inline=False)
+    embed.add_field(name="📌 Salon", value=_message_channel_label(before.channel), inline=False)
+    embed.add_field(name="🕐 Envoyé", value=f"<t:{int(before.created_at.timestamp())}:F>", inline=True)
+    if after.edited_at:
+        embed.add_field(name="⏱️ Modifié", value=f"<t:{int(after.edited_at.timestamp())}:F>", inline=True)
+    embed.add_field(name="🔗 Lien", value=f"[Aller au message]({after.jump_url})", inline=True)
+    if before.content != after.content:
+        embed.add_field(name="📝 Avant", value=_codeblock(before.content, 900), inline=False)
+        embed.add_field(name="✅ Après", value=_codeblock(after.content, 900), inline=False)
+    if attachments_changed:
+        embed.add_field(
+            name="📎 Pièces jointes",
+            value=f"Avant: {len(before.attachments)} • Après: {len(after.attachments)}",
+            inline=False,
+        )
+        if after.attachments:
+            embed.add_field(name="📥 Fichiers après édition", value=_format_attachment_lines(after.attachments), inline=False)
+    if embeds_changed:
+        embed.add_field(
+            name="🖼️ Embeds",
+            value=f"Avant: {len(before.embeds)} • Après: {len(after.embeds)}",
+            inline=False,
+        )
+        if after.embeds:
+            embed.add_field(name="🧩 Détail embeds", value=_format_embed_lines(after.embeds), inline=False)
     embed.set_footer(text=f"Message ID : {before.id} • User ID : {before.author.id}")
     await send_log(before.guild, embed)
+
+
+@bot.event
+async def on_bulk_message_delete(messages):
+    kept_messages = [msg for msg in messages if getattr(msg, "guild", None) and not msg.author.bot]
+    if not kept_messages:
+        return
+
+    guild = kept_messages[0].guild
+    channel = kept_messages[0].channel
+    author_ids = {msg.author.id for msg in kept_messages}
+    attachment_total = sum(len(msg.attachments) for msg in kept_messages)
+    sample_lines = []
+    for msg in sorted(kept_messages, key=lambda item: item.created_at)[:5]:
+        preview = msg.content or f"[{len(msg.attachments)} pièce(s) jointe(s)]"
+        sample_lines.append(f"• {msg.author} (`{msg.author.id}`): {_truncate(preview, 120)}")
+
+    audit_entry = await _find_recent_audit_entry(
+        guild,
+        getattr(discord.AuditLogAction, "message_bulk_delete", None),
+        channel_id=getattr(channel, "id", None),
+    )
+
+    embed = discord.Embed(title="🧹 Suppression massive", color=0xE74C3C, timestamp=datetime.utcnow())
+    embed.add_field(name="📌 Salon", value=_message_channel_label(channel), inline=False)
+    embed.add_field(name="🗑️ Messages", value=str(len(kept_messages)), inline=True)
+    embed.add_field(name="👥 Auteurs", value=str(len(author_ids)), inline=True)
+    embed.add_field(name="📎 Fichiers", value=str(attachment_total), inline=True)
+    embed.add_field(name="🧾 IDs", value=f"`{kept_messages[0].id}` → `{kept_messages[-1].id}`", inline=False)
+    if sample_lines:
+        embed.add_field(name="📝 Exemples", value=_truncate("\n".join(sample_lines), 1024), inline=False)
+    _add_audit_fields(embed, audit_entry, actor_label="🔨 Supprimé par")
+    await send_log(guild, embed)
 
 
 @bot.event
 async def on_member_ban(guild: discord.Guild, user: discord.User):
     embed = discord.Embed(title="🔨 Membre banni", color=0x8B0000, timestamp=datetime.utcnow())
     embed.set_thumbnail(url=user.display_avatar.url)
-    embed.add_field(name="Membre", value=f"{user} (`{user.id}`)")
-    try:
-        entries = [e async for e in guild.audit_logs(limit=1, action=discord.AuditLogAction.ban)]
-        if entries:
-            embed.add_field(name="Banni par", value=str(entries[0].user))
-            embed.add_field(name="Raison", value=entries[0].reason or "Aucune")
-    except Exception:
-        pass
+    embed.add_field(name="Membre", value=f"{user} (`{user.id}`)", inline=False)
+    audit_entry = await _find_recent_audit_entry(
+        guild,
+        getattr(discord.AuditLogAction, "ban", None),
+        target_id=user.id,
+    )
+    _add_audit_fields(embed, audit_entry, actor_label="👮 Banni par")
     await send_log(guild, embed)
 
 
@@ -1564,7 +1221,13 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
 async def on_member_unban(guild: discord.Guild, user: discord.User):
     embed = discord.Embed(title="✅ Membre débanni", color=0x57F287, timestamp=datetime.utcnow())
     embed.set_thumbnail(url=user.display_avatar.url)
-    embed.add_field(name="Membre", value=f"{user} (`{user.id}`)")
+    embed.add_field(name="Membre", value=f"{user} (`{user.id}`)", inline=False)
+    audit_entry = await _find_recent_audit_entry(
+        guild,
+        getattr(discord.AuditLogAction, "unban", None),
+        target_id=user.id,
+    )
+    _add_audit_fields(embed, audit_entry, actor_label="👮 Débanni par")
     await send_log(guild, embed)
 
 
@@ -1572,6 +1235,13 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
 async def on_member_update(before: discord.Member, after: discord.Member):
     added   = [r for r in after.roles  if r not in before.roles]
     removed = [r for r in before.roles if r not in after.roles]
+    nick_changed = before.nick != after.nick
+    global_name_changed = getattr(before, "global_name", None) != getattr(after, "global_name", None)
+    username_changed = before.name != after.name
+    avatar_changed = str(before.display_avatar.url) != str(after.display_avatar.url)
+    before_timeout = getattr(before, "timed_out_until", None)
+    after_timeout = getattr(after, "timed_out_until", None)
+    timeout_changed = before_timeout != after_timeout
 
     # ── Détection Boost via rôle Nitro Booster ─────────────────
     # Méthode fiable : détecter l'ajout/retrait du rôle premium_subscriber
@@ -1633,38 +1303,343 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         log.add_field(name="Membre", value=f"{after.mention} (`{after.id}`)")
         await send_log(after.guild, log)
 
+    if timeout_changed:
+        audit_entry = await _find_recent_audit_entry(
+            after.guild,
+            getattr(discord.AuditLogAction, "member_update", None),
+            target_id=after.id,
+        )
+        now_ts = datetime.utcnow().timestamp()
+        timed_out = after_timeout is not None and after_timeout.timestamp() > now_ts
+        timeout_log = discord.Embed(
+            title="⏳ Timeout appliqué" if timed_out else "✅ Timeout retiré",
+            color=0xE67E22 if timed_out else 0x57F287,
+            timestamp=datetime.utcnow(),
+        )
+        timeout_log.set_author(name=str(after), icon_url=after.display_avatar.url)
+        timeout_log.add_field(name="Membre", value=f"{after.mention} (`{after.id}`)", inline=False)
+        timeout_log.add_field(name="Avant", value=f"<t:{int(before_timeout.timestamp())}:F>" if before_timeout else "Aucun", inline=True)
+        timeout_log.add_field(name="Après", value=f"<t:{int(after_timeout.timestamp())}:F>" if after_timeout else "Aucun", inline=True)
+        if timed_out and after_timeout:
+            remaining = int(after_timeout.timestamp() - datetime.utcnow().timestamp())
+            timeout_log.add_field(name="Durée restante", value=f"{max(0, remaining // 60)} min", inline=True)
+        _add_audit_fields(timeout_log, audit_entry)
+        await send_log(after.guild, timeout_log)
+
+    if nick_changed or global_name_changed or username_changed or avatar_changed:
+        profile_log = discord.Embed(title="🪪 Profil membre mis à jour", color=0x5865F2, timestamp=datetime.utcnow())
+        profile_log.set_author(name=str(after), icon_url=after.display_avatar.url)
+        profile_log.add_field(name="Membre", value=f"{after.mention} (`{after.id}`)", inline=False)
+        if username_changed:
+            profile_log.add_field(name="👤 Username", value=f"`{before.name}` → `{after.name}`", inline=False)
+        if global_name_changed:
+            before_global = getattr(before, "global_name", None) or "Aucun"
+            after_global = getattr(after, "global_name", None) or "Aucun"
+            profile_log.add_field(name="🌍 Nom global", value=f"`{before_global}` → `{after_global}`", inline=False)
+        if nick_changed:
+            before_nick = before.nick or "Aucun"
+            after_nick = after.nick or "Aucun"
+            profile_log.add_field(name="🏷️ Surnom serveur", value=f"`{before_nick}` → `{after_nick}`", inline=False)
+        if avatar_changed:
+            profile_log.add_field(name="🖼️ Avatar", value="[Avant](%s)\n[Après](%s)" % (before.display_avatar.url, after.display_avatar.url), inline=False)
+            profile_log.set_thumbnail(url=after.display_avatar.url)
+        audit_entry = None
+        if nick_changed:
+            audit_entry = await _find_recent_audit_entry(
+                after.guild,
+                getattr(discord.AuditLogAction, "member_update", None),
+                target_id=after.id,
+            )
+        _add_audit_fields(profile_log, audit_entry)
+        await send_log(after.guild, profile_log)
+
     # ── Logs rôles ─────────────────────────────────────────────
     if not added and not removed:
         return
+
+    role_audit_entry = await _find_recent_audit_entry(
+        after.guild,
+        getattr(discord.AuditLogAction, "member_role_update", None),
+        target_id=after.id,
+    )
     embed = discord.Embed(title="🎭 Rôles mis à jour", color=0x9B59B6, timestamp=datetime.utcnow())
     embed.set_author(name=str(after), icon_url=after.display_avatar.url)
-    embed.add_field(name="Membre", value=f"{after.mention} (`{after.id}`)")
+    embed.add_field(name="Membre", value=f"{after.mention} (`{after.id}`)", inline=False)
+    embed.add_field(name="📊 Total rôles", value=str(len(after.roles) - 1), inline=True)
     if added:
-        embed.add_field(name="➕ Ajouté(s)",  value="\n".join(r.mention for r in added))
+        embed.add_field(name="➕ Ajouté(s)",  value=_truncate("\n".join(r.mention for r in added), 1024), inline=False)
     if removed:
-        embed.add_field(name="➖ Retiré(s)", value="\n".join(r.mention for r in removed))
+        embed.add_field(name="➖ Retiré(s)", value=_truncate("\n".join(r.mention for r in removed), 1024), inline=False)
+    _add_audit_fields(embed, role_audit_entry)
     await send_log(after.guild, embed)
 
 
 @bot.event
 async def on_guild_channel_create(channel):
+    audit_entry = await _find_recent_audit_entry(
+        channel.guild,
+        getattr(discord.AuditLogAction, "channel_create", None),
+        target_id=channel.id,
+    )
     embed = discord.Embed(title="📁 Salon créé", color=0x3498DB, timestamp=datetime.utcnow())
-    embed.add_field(name="Salon", value=f"{channel.mention} (`{channel.id}`)")
-    embed.add_field(name="Type",  value=str(channel.type))
+    embed.add_field(name="Salon", value=_message_channel_label(channel), inline=False)
+    embed.add_field(name="Type", value=str(channel.type), inline=True)
+    embed.add_field(name="Position", value=str(getattr(channel, "position", 0)), inline=True)
+    if getattr(channel, "topic", None):
+        embed.add_field(name="Sujet", value=_truncate(channel.topic, 1024), inline=False)
+    if hasattr(channel, "slowmode_delay"):
+        embed.add_field(name="Slowmode", value=f"{getattr(channel, 'slowmode_delay', 0)}s", inline=True)
+    _add_audit_fields(embed, audit_entry)
     await send_log(channel.guild, embed)
 
 
 @bot.event
 async def on_guild_channel_delete(channel):
+    audit_entry = await _find_recent_audit_entry(
+        channel.guild,
+        getattr(discord.AuditLogAction, "channel_delete", None),
+        target_id=channel.id,
+    )
     embed = discord.Embed(title="🗑️ Salon supprimé", color=0xE74C3C, timestamp=datetime.utcnow())
-    embed.add_field(name="Nom",  value=channel.name)
-    embed.add_field(name="Type", value=str(channel.type))
+    embed.add_field(name="Nom", value=f"`{channel.name}` (`{channel.id}`)", inline=False)
+    embed.add_field(name="Type", value=str(channel.type), inline=True)
+    embed.add_field(name="Position", value=str(getattr(channel, "position", 0)), inline=True)
+    category = getattr(channel, "category", None)
+    if category:
+        embed.add_field(name="Catégorie", value=f"`{category.name}`", inline=True)
+    if getattr(channel, "topic", None):
+        embed.add_field(name="Sujet", value=_truncate(channel.topic, 1024), inline=False)
+    _add_audit_fields(embed, audit_entry)
     await send_log(channel.guild, embed)
 
 
 @bot.event
+async def on_guild_channel_update(before, after):
+    changes = []
+    if before.name != after.name:
+        changes.append(f"• Nom: `{before.name}` → `{after.name}`")
+    if getattr(before, "category_id", None) != getattr(after, "category_id", None):
+        before_cat = before.category.name if getattr(before, "category", None) else "Aucune"
+        after_cat = after.category.name if getattr(after, "category", None) else "Aucune"
+        changes.append(f"• Catégorie: `{before_cat}` → `{after_cat}`")
+    if getattr(before, "position", None) != getattr(after, "position", None):
+        changes.append(f"• Position: `{getattr(before, 'position', 0)}` → `{getattr(after, 'position', 0)}`")
+    if getattr(before, "topic", None) != getattr(after, "topic", None):
+        changes.append(f"• Sujet: `{_truncate(getattr(before, 'topic', None) or 'Aucun', 120)}` → `{_truncate(getattr(after, 'topic', None) or 'Aucun', 120)}`")
+    if getattr(before, "slowmode_delay", None) != getattr(after, "slowmode_delay", None):
+        changes.append(f"• Slowmode: `{getattr(before, 'slowmode_delay', 0)}s` → `{getattr(after, 'slowmode_delay', 0)}s`")
+    if getattr(before, "nsfw", None) != getattr(after, "nsfw", None):
+        changes.append(f"• NSFW: `{_bool_label(getattr(before, 'nsfw', False))}` → `{_bool_label(getattr(after, 'nsfw', False))}`")
+    if getattr(before, "bitrate", None) != getattr(after, "bitrate", None):
+        changes.append(f"• Bitrate: `{getattr(before, 'bitrate', 0)}` → `{getattr(after, 'bitrate', 0)}`")
+    if getattr(before, "user_limit", None) != getattr(after, "user_limit", None):
+        changes.append(f"• User limit: `{getattr(before, 'user_limit', 0)}` → `{getattr(after, 'user_limit', 0)}`")
+    overwrite_changes = _describe_overwrite_changes(before, after)
+    if overwrite_changes:
+        changes.append("• Permissions du salon modifiées")
+    if not changes:
+        return
+
+    audit_entry = await _find_recent_audit_entry(
+        after.guild,
+        getattr(discord.AuditLogAction, "channel_update", None),
+        target_id=after.id,
+    )
+    embed = discord.Embed(title="🛠️ Salon modifié", color=0xF1C40F, timestamp=datetime.utcnow())
+    embed.add_field(name="Salon", value=_message_channel_label(after), inline=False)
+    embed.add_field(name="Modifications", value=_truncate("\n".join(changes), 1024), inline=False)
+    if overwrite_changes:
+        embed.add_field(name="🔐 Détail permissions", value=overwrite_changes, inline=False)
+    _add_audit_fields(embed, audit_entry)
+    await send_log(after.guild, embed)
+
+
+@bot.event
+async def on_guild_role_create(role: discord.Role):
+    audit_entry = await _find_recent_audit_entry(
+        role.guild,
+        getattr(discord.AuditLogAction, "role_create", None),
+        target_id=role.id,
+    )
+    embed = discord.Embed(title="🧩 Rôle créé", color=0x57F287, timestamp=datetime.utcnow())
+    embed.add_field(name="Rôle", value=f"{role.mention} (`{role.id}`)", inline=False)
+    embed.add_field(name="Couleur", value=str(role.color), inline=True)
+    embed.add_field(name="Position", value=str(role.position), inline=True)
+    embed.add_field(name="Mentionnable", value="Oui" if role.mentionable else "Non", inline=True)
+    embed.add_field(name="Affiché séparément", value="Oui" if role.hoist else "Non", inline=True)
+    embed.add_field(name="Permissions", value=_format_permissions(role), inline=False)
+    _add_audit_fields(embed, audit_entry)
+    await send_log(role.guild, embed)
+
+
+@bot.event
+async def on_guild_role_update(before: discord.Role, after: discord.Role):
+    changes = []
+    if before.name != after.name:
+        changes.append(f"• Nom: `{before.name}` → `{after.name}`")
+    if before.color != after.color:
+        changes.append(f"• Couleur: `{before.color}` → `{after.color}`")
+    if before.position != after.position:
+        changes.append(f"• Position: `{before.position}` → `{after.position}`")
+    if before.mentionable != after.mentionable:
+        changes.append(f"• Mentionnable: `{_bool_label(before.mentionable)}` → `{_bool_label(after.mentionable)}`")
+    if before.hoist != after.hoist:
+        changes.append(f"• Affiché séparément: `{_bool_label(before.hoist)}` → `{_bool_label(after.hoist)}`")
+    permissions_changed = before.permissions != after.permissions
+    if permissions_changed:
+        changes.append("• Permissions modifiées")
+    if not changes:
+        return
+
+    audit_entry = await _find_recent_audit_entry(
+        after.guild,
+        getattr(discord.AuditLogAction, "role_update", None),
+        target_id=after.id,
+    )
+    embed = discord.Embed(title="🎛️ Rôle modifié", color=0xF1C40F, timestamp=datetime.utcnow())
+    embed.add_field(name="Rôle", value=f"{after.mention} (`{after.id}`)", inline=False)
+    embed.add_field(name="Modifications", value=_truncate("\n".join(changes), 1024), inline=False)
+    if permissions_changed:
+        embed.add_field(name="Détail permissions", value=_describe_permission_changes(before, after), inline=False)
+    _add_audit_fields(embed, audit_entry)
+    await send_log(after.guild, embed)
+
+
+@bot.event
+async def on_guild_role_delete(role: discord.Role):
+    audit_entry = await _find_recent_audit_entry(
+        role.guild,
+        getattr(discord.AuditLogAction, "role_delete", None),
+        target_id=role.id,
+    )
+    embed = discord.Embed(title="🗑️ Rôle supprimé", color=0xED4245, timestamp=datetime.utcnow())
+    embed.add_field(name="Nom", value=f"`{role.name}` (`{role.id}`)", inline=False)
+    embed.add_field(name="Couleur", value=str(role.color), inline=True)
+    embed.add_field(name="Position", value=str(role.position), inline=True)
+    embed.add_field(name="Mentionnable", value="Oui" if role.mentionable else "Non", inline=True)
+    embed.add_field(name="Permissions", value=_format_permissions(role), inline=False)
+    _add_audit_fields(embed, audit_entry)
+    await send_log(role.guild, embed)
+
+
+@bot.event
+async def on_guild_emojis_update(guild: discord.Guild, before, after):
+    before_map = {emoji.id: emoji for emoji in before}
+    after_map = {emoji.id: emoji for emoji in after}
+    added = [emoji for emoji_id, emoji in after_map.items() if emoji_id not in before_map]
+    removed = [emoji for emoji_id, emoji in before_map.items() if emoji_id not in after_map]
+    renamed = []
+    for emoji_id in sorted(set(before_map) & set(after_map)):
+        if before_map[emoji_id].name != after_map[emoji_id].name:
+            renamed.append((before_map[emoji_id], after_map[emoji_id]))
+    if not added and not removed and not renamed:
+        return
+
+    embed = discord.Embed(title="😀 Emojis mis à jour", color=0xF1C40F, timestamp=datetime.utcnow())
+    embed.add_field(name="Serveur", value=f"`{guild.name}` (`{guild.id}`)", inline=False)
+    if added:
+        audit_entry = await _find_recent_audit_entry(
+            guild,
+            getattr(discord.AuditLogAction, "emoji_create", None),
+            target_id=added[0].id,
+        )
+        embed.add_field(name="➕ Ajouté(s)", value=_format_emoji_lines(added), inline=False)
+        _add_audit_fields(embed, audit_entry)
+    if removed:
+        audit_entry = await _find_recent_audit_entry(
+            guild,
+            getattr(discord.AuditLogAction, "emoji_delete", None),
+            target_id=removed[0].id,
+        )
+        embed.add_field(name="➖ Supprimé(s)", value=_format_emoji_lines(removed), inline=False)
+        if not added:
+            _add_audit_fields(embed, audit_entry)
+    if renamed:
+        rename_lines = [f"• `:{old.name}:` → `:{new.name}:` (`{new.id}`)" for old, new in renamed[:10]]
+        embed.add_field(name="✏️ Renommé(s)", value=_truncate("\n".join(rename_lines), 1024), inline=False)
+    await send_log(guild, embed)
+
+
+@bot.event
+async def on_guild_stickers_update(guild: discord.Guild, before, after):
+    before_map = {sticker.id: sticker for sticker in before}
+    after_map = {sticker.id: sticker for sticker in after}
+    added = [sticker for sticker_id, sticker in after_map.items() if sticker_id not in before_map]
+    removed = [sticker for sticker_id, sticker in before_map.items() if sticker_id not in after_map]
+    renamed = []
+    for sticker_id in sorted(set(before_map) & set(after_map)):
+        if before_map[sticker_id].name != after_map[sticker_id].name:
+            renamed.append((before_map[sticker_id], after_map[sticker_id]))
+    if not added and not removed and not renamed:
+        return
+
+    embed = discord.Embed(title="🧷 Stickers mis à jour", color=0xF1C40F, timestamp=datetime.utcnow())
+    embed.add_field(name="Serveur", value=f"`{guild.name}` (`{guild.id}`)", inline=False)
+    if added:
+        audit_entry = await _find_recent_audit_entry(
+            guild,
+            getattr(discord.AuditLogAction, "sticker_create", None),
+            target_id=added[0].id,
+        )
+        embed.add_field(name="➕ Ajouté(s)", value=_format_sticker_lines(added), inline=False)
+        _add_audit_fields(embed, audit_entry)
+    if removed:
+        audit_entry = await _find_recent_audit_entry(
+            guild,
+            getattr(discord.AuditLogAction, "sticker_delete", None),
+            target_id=removed[0].id,
+        )
+        embed.add_field(name="➖ Supprimé(s)", value=_format_sticker_lines(removed), inline=False)
+        if not added:
+            _add_audit_fields(embed, audit_entry)
+    if renamed:
+        rename_lines = [f"• `{old.name}` → `{new.name}` (`{new.id}`)" for old, new in renamed[:10]]
+        embed.add_field(name="✏️ Renommé(s)", value=_truncate("\n".join(rename_lines), 1024), inline=False)
+    await send_log(guild, embed)
+
+
+@bot.event
+async def on_webhooks_update(channel):
+    guild = getattr(channel, "guild", None)
+    if not guild:
+        return
+    action = None
+    title = "🪝 Webhooks mis à jour"
+    for action_name, label in (
+        ("webhook_create", "🪝 Webhook créé"),
+        ("webhook_update", "🛠️ Webhook modifié"),
+        ("webhook_delete", "🗑️ Webhook supprimé"),
+    ):
+        entry = await _find_recent_audit_entry(
+            guild,
+            getattr(discord.AuditLogAction, action_name, None),
+            channel_id=getattr(channel, "id", None),
+        )
+        if entry:
+            action = entry
+            title = label
+            break
+
+    embed = discord.Embed(title=title, color=0x3498DB, timestamp=datetime.utcnow())
+    embed.add_field(name="Salon", value=_message_channel_label(channel), inline=False)
+    if action and getattr(action, "target", None):
+        target = action.target
+        embed.add_field(
+            name="Webhook",
+            value=f"`{getattr(target, 'name', 'Inconnu')}` (`{getattr(target, 'id', 'n/a')}`)",
+            inline=False,
+        )
+    _add_audit_fields(embed, action)
+    await send_log(guild, embed)
+
+
+@bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    if before.channel == after.channel:
+    channel_changed = before.channel != after.channel
+    flags_before = _voice_state_flags(before)
+    flags_after = _voice_state_flags(after)
+    flags_changed = flags_before != flags_after
+    if not channel_changed and not flags_changed:
         return
     now = datetime.utcnow().timestamp()
     uid = member.id
@@ -1687,7 +1662,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             d["voice_history"] = [(s, e) for s, e in d["voice_history"] if e >= cutoff]
             _track_quest_progress(uid, "voice_seconds", duration)
             mark_data_dirty()
-    elif before.channel and after.channel:
+    elif before.channel and after.channel and channel_changed:
         # Changement de salon
         if uid in voice_join_time:
             start = voice_join_time[uid]
@@ -1704,16 +1679,25 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
     embed = discord.Embed(color=0x1ABC9C, timestamp=datetime.utcnow())
     embed.set_author(name=str(member), icon_url=member.display_avatar.url)
+    embed.add_field(name="Membre", value=f"{member.mention} (`{member.id}`)", inline=False)
     if not before.channel and after.channel:
         embed.title = "🔊 Rejoint un vocal"
-        embed.add_field(name="Salon", value=after.channel.name)
+        embed.add_field(name="Salon", value=_message_channel_label(after.channel), inline=False)
     elif before.channel and not after.channel:
         embed.title = "🔇 Quitté un vocal"
-        embed.add_field(name="Salon", value=before.channel.name)
-    else:
+        embed.add_field(name="Salon", value=_message_channel_label(before.channel), inline=False)
+    elif channel_changed:
         embed.title = "🔀 Changement vocal"
-        embed.add_field(name="Avant", value=before.channel.name)
-        embed.add_field(name="Après", value=after.channel.name)
+        embed.add_field(name="Avant", value=_message_channel_label(before.channel), inline=False)
+        embed.add_field(name="Après", value=_message_channel_label(after.channel), inline=False)
+    else:
+        embed.title = "🎙️ État vocal modifié"
+        embed.add_field(name="Salon", value=_message_channel_label(after.channel or before.channel), inline=False)
+    if flags_changed:
+        before_flags_text = ", ".join(flags_before) if flags_before else "Aucun"
+        after_flags_text = ", ".join(flags_after) if flags_after else "Aucun"
+        embed.add_field(name="Avant", value=before_flags_text, inline=True)
+        embed.add_field(name="Après", value=after_flags_text, inline=True)
     await send_log(member.guild, embed)
 
 # ════════════════════════════════════════════════════════════════
@@ -2163,52 +2147,6 @@ async def slash_slots(interaction: discord.Interaction):
     embed = discord.Embed(title="🎰 Machine à sous", description=f"**{line}**\n\n{result}", color=color)
     embed.set_footer(text=f"Joué par {interaction.user.display_name}")
     await interaction.response.send_message(embed=embed)
-
-
-@game_group.command(name="akinator", description="🧠 Lance une partie d'Akinator")
-@app_commands.choices(theme=[
-    app_commands.Choice(name="Personnage", value="personnage"),
-    app_commands.Choice(name="Animal", value="animal"),
-    app_commands.Choice(name="Objet", value="objet"),
-])
-async def slash_akinator(interaction: discord.Interaction, theme: str = "personnage"):
-    if not AKINATOR_ENABLED and not _akinator_use_remote_service():
-        await interaction.response.send_message(
-            "❌ Akinator n'est pas disponible sur cette instance. Installe la dépendance locale ou configure `AKINATOR_SERVICE_URL`.",
-            ephemeral=True,
-        )
-        return
-
-    existing = akinator_sessions.get(interaction.user.id)
-    if existing:
-        await _cleanup_akinator_session(interaction.user.id)
-
-    await interaction.response.defer()
-    try:
-        if _akinator_use_remote_service():
-            payload = await _akinator_remote_request(
-                "/start",
-                {"theme": AKINATOR_THEMES.get(theme, "c"), "child_mode": False},
-            )
-            aki = _remote_akinator_state_to_obj(payload)
-        else:
-            aki = _make_akinator_client()
-            await _start_akinator_game(aki, AKINATOR_THEMES.get(theme, "c"))
-    except Exception as exc:
-        print(f"⚠️ Akinator startup error: {exc}")
-        await interaction.followup.send(_format_akinator_user_error("le démarrage", exc), ephemeral=True)
-        await _cleanup_akinator_session(interaction.user.id)
-        return
-
-    akinator_sessions[interaction.user.id] = {
-        "aki": aki,
-        "token": _next_akinator_session_token(),
-        "channel_id": interaction.channel_id,
-        "started_at": datetime.utcnow().timestamp(),
-    }
-    view = AkinatorQuestionView(interaction.user.id, akinator_sessions[interaction.user.id]["token"])
-    message = await interaction.followup.send(embed=_akinator_question_embed(interaction.user, aki), view=view, wait=True)
-    view.message = message
 
 
 @game_group.command(name="guess", description="🔢 Devine un nombre entre 1 et 100 (5 essais)")
