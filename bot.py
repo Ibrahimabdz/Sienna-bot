@@ -539,6 +539,10 @@ async def _start_akinator_game(aki: AsyncAkinator, theme: str, *, child_mode: bo
     raise RuntimeError(" ; ".join(errors[-4:]) or "Échec du démarrage Akinator")
 
 
+def _format_akinator_user_error(action: str) -> str:
+    return f"❌ Akinator est indisponible pour le moment pendant {action}. Réessaie dans quelques secondes."
+
+
 def _akinator_apply_payload(aki: AsyncAkinator, payload: dict):
     aki.completion = payload.get("completion", getattr(aki, "completion", None))
     if aki.completion == "KO - TIMEOUT":
@@ -740,9 +744,10 @@ class AkinatorQuestionView(discord.ui.View):
         try:
             await _akinator_answer(aki, answer)
         except Exception as exc:
+            print(f"⚠️ Akinator answer error: {exc}")
             await _cleanup_akinator_session(self.user_id)
             await interaction.response.edit_message(
-                content=f"❌ Akinator a rencontré une erreur: `{exc}`",
+                content=_format_akinator_user_error("la partie"),
                 embed=None,
                 view=None,
             )
@@ -804,8 +809,9 @@ class AkinatorQuestionView(discord.ui.View):
             await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
             return
         except Exception as exc:
+            print(f"⚠️ Akinator back error: {exc}")
             await _cleanup_akinator_session(self.user_id)
-            await interaction.response.edit_message(content=f"❌ Akinator a rencontré une erreur: `{exc}`", embed=None, view=None)
+            await interaction.response.edit_message(content=_format_akinator_user_error("le retour arrière"), embed=None, view=None)
             return
         new_view = AkinatorQuestionView(self.user_id)
         new_view.message = interaction.message
@@ -853,8 +859,9 @@ class AkinatorGuessView(discord.ui.View):
         try:
             await _akinator_answer(aki, "yes")
         except Exception as exc:
+            print(f"⚠️ Akinator confirm error: {exc}")
             await _cleanup_akinator_session(self.user_id)
-            await interaction.response.edit_message(content=f"❌ Akinator a rencontré une erreur: `{exc}`", embed=None, view=None)
+            await interaction.response.edit_message(content=_format_akinator_user_error("la validation"), embed=None, view=None)
             return
         await _cleanup_akinator_session(self.user_id)
         await interaction.response.edit_message(embed=_akinator_finished_embed(interaction.user, aki), view=None)
@@ -868,8 +875,9 @@ class AkinatorGuessView(discord.ui.View):
         try:
             await _akinator_answer(aki, "no")
         except Exception as exc:
+            print(f"⚠️ Akinator deny error: {exc}")
             await _cleanup_akinator_session(self.user_id)
-            await interaction.response.edit_message(content=f"❌ Akinator a rencontré une erreur: `{exc}`", embed=None, view=None)
+            await interaction.response.edit_message(content=_format_akinator_user_error("la relance"), embed=None, view=None)
             return
 
         new_view = AkinatorQuestionView(self.user_id)
@@ -2017,7 +2025,8 @@ async def slash_akinator(interaction: discord.Interaction, theme: str = "personn
     try:
         await _start_akinator_game(aki, AKINATOR_THEMES.get(theme, "c"))
     except Exception as exc:
-        await interaction.followup.send(f"❌ Impossible de démarrer Akinator pour le moment: `{exc}`", ephemeral=True)
+        print(f"⚠️ Akinator startup error: {exc}")
+        await interaction.followup.send(_format_akinator_user_error("le démarrage"), ephemeral=True)
         await _cleanup_akinator_session(interaction.user.id)
         return
 
