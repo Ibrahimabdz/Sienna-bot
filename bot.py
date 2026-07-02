@@ -65,6 +65,7 @@ def save_data():
             "comics_last_posted": comics_last_posted,
             "gacha_profiles": {str(k): v for k, v in gacha_profiles.items()},
             "economy_profiles": {str(k): v for k, v in economy_profiles.items()},
+            "cv_character_pool_cache": {str(k): v for k, v in cv_character_pool_cache.items()},
             "config": {
                 "CONFESSION_CHANNEL_ID": CONFESSION_CHANNEL_ID,
                 "BOOST_CHANNEL_ID":       BOOST_CHANNEL_ID,
@@ -92,6 +93,96 @@ def save_data():
 def mark_data_dirty():
     global _data_dirty
     _data_dirty = True
+
+
+# ════════════════════════════════════════════════════════════════
+#  🎨  CHARTE VISUELLE — helpers de design pour les embeds
+# ════════════════════════════════════════════════════════════════
+# Palette cohérente réutilisée dans tout le bot.
+BRAND = {
+    "primary": 0x8B0000,   # rouge Taverne (identité)
+    "gold":    0xF1C40F,   # économie / coins
+    "success": 0x57F287,   # validation
+    "danger":  0xED4245,   # sanction lourde
+    "warn":    0xFAA61A,   # avertissement / mute
+    "info":    0x5865F2,   # information
+    "muted":   0x2B2D31,   # fond neutre Discord
+}
+
+def fmt_coins(amount) -> str:
+    """1234567 → '1 234 567 🪙' (séparateur d'espace fine, style FR)."""
+    return f"{int(amount):,}".replace(",", " ")
+
+def progress_bar(current: int, total: int, length: int = 12) -> str:
+    """Barre de progression visuelle : ▰▰▰▰▱▱▱▱▱▱▱▱  42%"""
+    total = max(int(total), 1)
+    ratio = min(max(current / total, 0.0), 1.0)
+    filled = round(ratio * length)
+    bar = "▰" * filled + "▱" * (length - filled)
+    return f"{bar}  {int(ratio * 100)}%"
+
+def brand_footer(embed: discord.Embed, text: str, icon=None) -> discord.Embed:
+    """Footer uniforme « … • La Taverne »."""
+    embed.set_footer(text=f"{text} • La Taverne", icon_url=icon)
+    return embed
+
+def build_mod_embed(
+    *,
+    action: str,
+    emoji: str,
+    color: int,
+    target: discord.abc.User,
+    moderator: discord.abc.User,
+    reason: str,
+    dm_sent: bool | None = None,
+    extra: list[tuple[str, str, bool]] | None = None,
+) -> discord.Embed:
+    """Embed de sanction premium et cohérent (message public + log)."""
+    embed = discord.Embed(
+        title=f"{emoji}  {action}",
+        color=color,
+        timestamp=datetime.utcnow(),
+    )
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(name="👤 Membre", value=f"{target.mention}\n`{target}` · `{target.id}`", inline=True)
+    embed.add_field(name="🛡️ Modérateur", value=moderator.mention, inline=True)
+    if extra:
+        for name, value, inline in extra:
+            embed.add_field(name=name, value=value, inline=inline)
+    embed.add_field(name="📋 Raison", value=f"> {reason}", inline=False)
+    if dm_sent is not None:
+        embed.add_field(
+            name="✉️ Notification",
+            value="Membre prévenu en MP ✅" if dm_sent else "MP non délivré ❌ (DMs fermés)",
+            inline=False,
+        )
+    brand_footer(embed, "Modération", icon=moderator.display_avatar.url)
+    return embed
+
+def build_mod_dm_embed(
+    *,
+    title: str,
+    color: int,
+    guild_name: str,
+    reason: str,
+    moderator: discord.abc.User,
+    note: str,
+    extra: list[tuple[str, str, bool]] | None = None,
+) -> discord.Embed:
+    """Embed envoyé en MP au membre sanctionné."""
+    embed = discord.Embed(
+        title=title,
+        description=f"Sur le serveur **{guild_name}**.",
+        color=color,
+        timestamp=datetime.utcnow(),
+    )
+    if extra:
+        for name, value, inline in extra:
+            embed.add_field(name=name, value=value, inline=inline)
+    embed.add_field(name="📋 Raison", value=f"> {reason}", inline=False)
+    embed.add_field(name="🛡️ Modérateur", value=str(moderator), inline=True)
+    embed.set_footer(text=note)
+    return embed
 
 
 def build_welcome_dm_embed(member: discord.Member, *, preview: bool = False) -> discord.Embed:
@@ -142,6 +233,7 @@ def load_data():
     global xp_data, warns, reaction_roles
     global open_tickets, announced_games, comics_last_posted
     global gacha_profiles, economy_profiles
+    global cv_character_pool_cache
     global _data_dirty
     global CONFESSION_CHANNEL_ID, confession_counter
     global WELCOME_CHANNEL_ID, GOODBYE_CHANNEL_ID, LOG_CHANNEL_ID
@@ -164,6 +256,10 @@ def load_data():
         comics_last_posted = payload.get("comics_last_posted", {})
         gacha_profiles = {int(k): v for k, v in payload.get("gacha_profiles", {}).items()}
         economy_profiles = {int(k): v for k, v in payload.get("economy_profiles", {}).items()}
+        try:
+            cv_character_pool_cache = {int(k): v for k, v in payload.get("cv_character_pool_cache", {}).items()}
+        except Exception:
+            cv_character_pool_cache = {}
         cfg = payload.get("config", {})
         CONFESSION_CHANNEL_ID = cfg.get("CONFESSION_CHANNEL_ID", CONFESSION_CHANNEL_ID)
         confession_counter    = cfg.get("confession_counter",    confession_counter)
@@ -203,7 +299,6 @@ def load_data():
 #  [12] 🔩  Commandes admin — Configuration
 #  [13] 🎮  Mini-jeux
 #  [14] 🎁  Jeux gratuits
-#  [15] 🐺  Jeu — Loup-Garou
 #  [16] 🔴  Jeu — Puissance 4
 #  [17] 📊  Compteurs de membres
 #  [18] 📈  Statistiques serveur
@@ -271,27 +366,17 @@ WEEKLY_QUEST_TEMPLATES = [
     {"id": "weekly_gacha", "label": "Faire 12 pulls gacha", "type": "gacha_pulls", "target": 12, "reward": 250, "scope": "weekly"},
 ]
 SHOP_ITEMS = {
-    "marvel_reset": {"label": "Reset Marvel", "price": 250, "description": "Remet ton quota Marvel à 0/10"},
-    "dc_reset": {"label": "Reset DC", "price": 250, "description": "Remet ton quota DC à 0/10"},
-    "all_reset": {"label": "Reset total", "price": 450, "description": "Remet Marvel et DC à 0/10"},
-    "marvel_pity": {"label": "Boost pity Marvel", "price": 300, "description": "Ajoute +3 pity sur Marvel"},
-    "dc_pity": {"label": "Boost pity DC", "price": 300, "description": "Ajoute +3 pity sur DC"},
-    "level_up": {"label": "Niveau +1", "price": 900, "description": "Achète un niveau supplémentaire"},
-    "custom_role": {"label": "Rôle personnalisable", "price": 3500, "description": "Débloque un rôle perso modifiable avec /roleperso"},
+    "marvel_reset": {"label": "Reset Marvel", "price": 250, "description": "Remet ton quota Marvel à 0/10", "emoji": "🔴", "cat": "🎴 Gacha — Recharges"},
+    "dc_reset": {"label": "Reset DC", "price": 250, "description": "Remet ton quota DC à 0/10", "emoji": "🔵", "cat": "🎴 Gacha — Recharges"},
+    "all_reset": {"label": "Reset total", "price": 450, "description": "Remet Marvel et DC à 0/10", "emoji": "♻️", "cat": "🎴 Gacha — Recharges"},
+    "marvel_pity": {"label": "Boost pity Marvel", "price": 300, "description": "Ajoute +3 pity sur Marvel", "emoji": "🎯", "cat": "🎴 Gacha — Pity"},
+    "dc_pity": {"label": "Boost pity DC", "price": 300, "description": "Ajoute +3 pity sur DC", "emoji": "🎯", "cat": "🎴 Gacha — Pity"},
+    "level_up": {"label": "Niveau +1", "price": 900, "description": "Achète un niveau supplémentaire", "emoji": "⬆️", "cat": "📈 Progression"},
+    "custom_role": {"label": "Rôle personnalisable", "price": 3500, "description": "Débloque un rôle perso modifiable avec /roleperso", "emoji": "🎨", "cat": "✨ Cosmétique"},
 }
-DISABLED_SLASH_COMMANDS = [
-    "loupgarou",
-    "lgvote",
-    "lgnuit",
-    "lgjour",
-    "lgvoir",
-    "lgsauver",
-    "lgpotion",
-    "lglier",
-    "lgchasser",
-    "lgstatus",
-    "lgarreter",
-]
+# Commandes slash à retirer au démarrage (sans supprimer leur code).
+# Loup-Garou a été supprimé entièrement du code — liste vide pour l'instant.
+DISABLED_SLASH_COMMANDS: list[str] = []
 
 # ════════════════════════════════════════════════════════════════
 #  🤖  [2] INTENTS & BOT
@@ -908,6 +993,9 @@ async def on_ready():
         counter_loop.start()
     if (MARVEL_CHANNEL_ID or DC_CHANNEL_ID) and not comics_auto_loop.is_running():
         comics_auto_loop.start()
+    # Pré-chargement des pools gacha Marvel/DC en tâche de fond (le premier pull sera instantané)
+    if COMICVINE_API_KEY:
+        asyncio.create_task(_prewarm_gacha_pools())
     # Cache des invitations pour tracker "qui a invité qui"
     bot._invite_cache = {}
     for guild in bot.guilds:
@@ -2705,24 +2793,27 @@ async def slash_ban(interaction: discord.Interaction, membre: discord.Member, ra
         return
 
     # MP au membre
-    dm_embed = discord.Embed(
+    dm_embed = build_mod_dm_embed(
         title="🔨 Tu as été banni",
-        description=f"Tu as été banni du serveur **{interaction.guild.name}**.",
-        color=0x8B0000, timestamp=datetime.utcnow()
+        color=BRAND["danger"],
+        guild_name=interaction.guild.name,
+        reason=raison,
+        moderator=interaction.user,
+        note="Si tu penses que c'est une erreur, contacte un administrateur.",
     )
-    dm_embed.add_field(name="Raison", value=raison, inline=False)
-    dm_embed.add_field(name="Modérateur", value=str(interaction.user))
-    dm_embed.set_footer(text="Si tu penses que c'est une erreur, contacte un administrateur.")
     dm_sent = await send_dm(membre, dm_embed)
 
     await membre.ban(reason=f"{raison} | Par {interaction.user}")
 
-    embed = discord.Embed(title="🔨 Membre banni", color=0x8B0000, timestamp=datetime.utcnow())
-    embed.set_thumbnail(url=membre.display_avatar.url)
-    embed.add_field(name="Membre",      value=f"{membre} (`{membre.id}`)")
-    embed.add_field(name="Modérateur",  value=interaction.user.mention)
-    embed.add_field(name="Raison",      value=raison, inline=False)
-    embed.add_field(name="MP envoyé",   value="✅ Oui" if dm_sent else "❌ Non (DMs fermés)")
+    embed = build_mod_embed(
+        action="Membre banni",
+        emoji="🔨",
+        color=BRAND["danger"],
+        target=membre,
+        moderator=interaction.user,
+        reason=raison,
+        dm_sent=dm_sent,
+    )
     await interaction.response.send_message(embed=embed)
 
     # Log
@@ -2738,24 +2829,27 @@ async def slash_kick(interaction: discord.Interaction, membre: discord.Member, r
         await interaction.response.send_message(block_reason, ephemeral=True)
         return
 
-    dm_embed = discord.Embed(
+    dm_embed = build_mod_dm_embed(
         title="👢 Tu as été expulsé",
-        description=f"Tu as été expulsé du serveur **{interaction.guild.name}**.",
-        color=0xFF6B00, timestamp=datetime.utcnow()
+        color=0xFF6B00,
+        guild_name=interaction.guild.name,
+        reason=raison,
+        moderator=interaction.user,
+        note="Tu peux revenir si tu as un lien d'invitation.",
     )
-    dm_embed.add_field(name="Raison",      value=raison, inline=False)
-    dm_embed.add_field(name="Modérateur",  value=str(interaction.user))
-    dm_embed.set_footer(text="Tu peux rejoindre le serveur si tu as un lien d'invitation.")
     dm_sent = await send_dm(membre, dm_embed)
 
     await membre.kick(reason=f"{raison} | Par {interaction.user}")
 
-    embed = discord.Embed(title="👢 Membre expulsé", color=0xFF6B00, timestamp=datetime.utcnow())
-    embed.set_thumbnail(url=membre.display_avatar.url)
-    embed.add_field(name="Membre",     value=f"{membre} (`{membre.id}`)")
-    embed.add_field(name="Modérateur", value=interaction.user.mention)
-    embed.add_field(name="Raison",     value=raison, inline=False)
-    embed.add_field(name="MP envoyé",  value="✅ Oui" if dm_sent else "❌ Non (DMs fermés)")
+    embed = build_mod_embed(
+        action="Membre expulsé",
+        emoji="👢",
+        color=0xFF6B00,
+        target=membre,
+        moderator=interaction.user,
+        reason=raison,
+        dm_sent=dm_sent,
+    )
     await interaction.response.send_message(embed=embed)
     await send_log(interaction.guild, embed)
 
@@ -2776,23 +2870,31 @@ async def slash_mute(interaction: discord.Interaction, membre: discord.Member, d
     until = discord.utils.utcnow() + timedelta(minutes=duree)
     await membre.timeout(until, reason=f"{raison} | Par {interaction.user}")
 
-    dm_embed = discord.Embed(
+    heures, minutes = divmod(duree, 60)
+    duree_txt = (f"{heures}h{minutes:02d}" if heures else f"{minutes} min")
+    fin_ts = int(until.timestamp())
+
+    dm_embed = build_mod_dm_embed(
         title="🔇 Tu as été mis en sourdine",
-        description=f"Tu as été rendu muet sur **{interaction.guild.name}**.",
-        color=0xFFA500, timestamp=datetime.utcnow()
+        color=BRAND["warn"],
+        guild_name=interaction.guild.name,
+        reason=raison,
+        moderator=interaction.user,
+        note="La sourdine se lèvera automatiquement à la fin du délai.",
+        extra=[("⏱️ Durée", duree_txt, True), ("⌛ Fin", f"<t:{fin_ts}:R>", True)],
     )
-    dm_embed.add_field(name="Durée",       value=f"{duree} minute(s)", inline=True)
-    dm_embed.add_field(name="Modérateur",  value=str(interaction.user), inline=True)
-    dm_embed.add_field(name="Raison",      value=raison, inline=False)
     dm_sent = await send_dm(membre, dm_embed)
 
-    embed = discord.Embed(title="🔇 Membre muté", color=0xFFA500, timestamp=datetime.utcnow())
-    embed.set_thumbnail(url=membre.display_avatar.url)
-    embed.add_field(name="Membre",     value=f"{membre} (`{membre.id}`)")
-    embed.add_field(name="Durée",      value=f"{duree} min")
-    embed.add_field(name="Modérateur", value=interaction.user.mention)
-    embed.add_field(name="Raison",     value=raison, inline=False)
-    embed.add_field(name="MP envoyé",  value="✅ Oui" if dm_sent else "❌ Non (DMs fermés)")
+    embed = build_mod_embed(
+        action="Membre réduit au silence",
+        emoji="🔇",
+        color=BRAND["warn"],
+        target=membre,
+        moderator=interaction.user,
+        reason=raison,
+        dm_sent=dm_sent,
+        extra=[("⏱️ Durée", duree_txt, True), ("⌛ Fin", f"<t:{fin_ts}:R>", True)],
+    )
     await interaction.response.send_message(embed=embed)
     await send_log(interaction.guild, embed)
 
@@ -2805,9 +2907,16 @@ async def slash_unmute(interaction: discord.Interaction, membre: discord.Member)
         await interaction.response.send_message(block_reason, ephemeral=True)
         return
     await membre.timeout(None)
-    embed = discord.Embed(title="🔊 Membre démuté", color=0x57F287, timestamp=datetime.utcnow())
-    embed.add_field(name="Membre",     value=f"{membre} (`{membre.id}`)")
-    embed.add_field(name="Modérateur", value=interaction.user.mention)
+    embed = discord.Embed(
+        title="🔊  Sourdine retirée",
+        description=f"{membre.mention} peut de nouveau parler.",
+        color=BRAND["success"],
+        timestamp=datetime.utcnow(),
+    )
+    embed.set_thumbnail(url=membre.display_avatar.url)
+    embed.add_field(name="👤 Membre", value=f"`{membre}` · `{membre.id}`", inline=True)
+    embed.add_field(name="🛡️ Modérateur", value=interaction.user.mention, inline=True)
+    brand_footer(embed, "Modération", icon=interaction.user.display_avatar.url)
     await interaction.response.send_message(embed=embed)
     await send_log(interaction.guild, embed)
 
@@ -2831,26 +2940,32 @@ async def slash_warn(interaction: discord.Interaction, membre: discord.Member, r
     count = len(warns[uid])
     save_data()
 
-    dm_embed = discord.Embed(
+    # Sévérité croissante + jauge visuelle (🔴🔴⚪ = 2/3)
+    warn_color = {1: BRAND["warn"], 2: 0xFF6B00}.get(count, BRAND["danger"])
+    dots = "🔴" * min(count, 3) + "⚪" * max(0, 3 - count)
+    warn_gauge = f"{dots}  **{count}/3**"
+
+    dm_embed = build_mod_dm_embed(
         title="⚠️ Tu as reçu un avertissement",
-        description=f"Tu as été averti sur **{interaction.guild.name}**.",
-        color=0xFFCC00, timestamp=datetime.utcnow()
+        color=warn_color,
+        guild_name=interaction.guild.name,
+        reason=raison,
+        moderator=interaction.user,
+        note="3 avertissements = bannissement automatique.",
+        extra=[("📊 Avertissements", warn_gauge, False)],
     )
-    dm_embed.add_field(name="Raison",          value=raison, inline=False)
-    dm_embed.add_field(name="Modérateur",       value=str(interaction.user))
-    dm_embed.add_field(name="Total warns",      value=f"{count}/3")
-    dm_embed.set_footer(text="3 avertissements = ban automatique.")
     dm_sent = await send_dm(membre, dm_embed)
 
-    embed = discord.Embed(
-        title=f"⚠️ Avertissement ({count}/3)",
-        color=0xFFCC00, timestamp=datetime.utcnow()
+    embed = build_mod_embed(
+        action=f"Avertissement {count}/3",
+        emoji="⚠️",
+        color=warn_color,
+        target=membre,
+        moderator=interaction.user,
+        reason=raison,
+        dm_sent=dm_sent,
+        extra=[("📊 Avertissements", warn_gauge, False)],
     )
-    embed.set_thumbnail(url=membre.display_avatar.url)
-    embed.add_field(name="Membre",     value=f"{membre.mention} (`{membre.id}`)")
-    embed.add_field(name="Modérateur", value=interaction.user.mention)
-    embed.add_field(name="Raison",     value=raison, inline=False)
-    embed.add_field(name="MP envoyé",  value="✅ Oui" if dm_sent else "❌ Non (DMs fermés)")
     await interaction.response.send_message(embed=embed)
     await send_log(interaction.guild, embed)
 
@@ -2999,601 +3114,6 @@ async def slash_clearuser(interaction: discord.Interaction, membre: discord.Memb
         await interaction.followup.send(f"❌ Erreur : {e}", ephemeral=True)
 
 
-
-
-import enum, random as _random
-
-class LGRole(enum.Enum):
-    VILLAGEOIS  = "Villageois"
-    LOUP_GAROU  = "Loup-Garou"
-    VOYANTE     = "Voyante"
-    SORCIERE    = "Sorcière"
-    CHASSEUR    = "Chasseur"
-    CUPIDON     = "Cupidon"
-    SALVATEUR   = "Salvateur"
-
-LG_ROLE_EMOJI = {
-    LGRole.VILLAGEOIS:  "👨‍🌾",
-    LGRole.LOUP_GAROU:  "🐺",
-    LGRole.VOYANTE:     "🔮",
-    LGRole.SORCIERE:    "🧙",
-    LGRole.CHASSEUR:    "🏹",
-    LGRole.CUPIDON:     "💘",
-    LGRole.SALVATEUR:   "🛡️",
-}
-
-LG_ROLE_COLOR = {
-    LGRole.LOUP_GAROU: 0x8B0000,
-    LGRole.VOYANTE:    0x9B59B6,
-    LGRole.SORCIERE:   0x27AE60,
-    LGRole.CHASSEUR:   0xE67E22,
-    LGRole.CUPIDON:    0xE91E8C,
-    LGRole.SALVATEUR:  0x3498DB,
-    LGRole.VILLAGEOIS: 0xF0C040,
-}
-
-LG_ROLE_DESC = {
-    LGRole.VILLAGEOIS: "Tu es un simple villageois. Vote le jour pour éliminer les loups !",
-    LGRole.LOUP_GAROU: "Tu es un Loup-Garou ! La nuit, coordonne-toi avec tes alliés pour dévorer un villageois.",
-    LGRole.VOYANTE:    "Tu es la Voyante. Chaque nuit tu peux révéler le rôle d'un joueur.",
-    LGRole.SORCIERE:   "Tu es la Sorcière. Tu possèdes une potion de vie et une potion de mort (une fois chacune).",
-    LGRole.CHASSEUR:   "Tu es le Chasseur. En mourant, tu peux emporter quelqu'un avec toi.",
-    LGRole.CUPIDON:    "Tu es Cupidon. La 1ère nuit, tu lies deux joueurs. Si l'un meurt, l'autre aussi.",
-    LGRole.SALVATEUR:  "Tu es le Salvateur. Chaque nuit tu protèges un joueur de l'attaque des loups.",
-}
-
-def lg_assign_roles(n: int) -> list[LGRole]:
-    """Distribue les rôles selon le nombre de joueurs."""
-    wolves = max(1, n // 4)
-    pool   = [LGRole.LOUP_GAROU] * wolves
-    specials = [LGRole.VOYANTE, LGRole.SORCIERE, LGRole.CHASSEUR, LGRole.CUPIDON, LGRole.SALVATEUR]
-    specials_count = min(len(specials), max(1, (n - wolves) // 3))
-    pool += specials[:specials_count]
-    while len(pool) < n:
-        pool.append(LGRole.VILLAGEOIS)
-    _random.shuffle(pool)
-    return pool
-
-# État des parties en cours
-lg_games: dict[int, dict] = {}  # {channel_id: game}
-
-class LGJoinView(discord.ui.View):
-    def __init__(self, channel_id: int):
-        super().__init__(timeout=120)
-        self.channel_id = channel_id
-
-    @discord.ui.button(label="⚔️ Rejoindre la partie", style=discord.ButtonStyle.success, custom_id="lg_join")
-    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
-        game = lg_games.get(self.channel_id)
-        if not game or game["phase"] != "lobby":
-            await interaction.response.send_message("❌ Plus de lobby disponible.", ephemeral=True)
-            return
-        if interaction.user in game["players"]:
-            await interaction.response.send_message("✅ Tu es déjà inscrit !", ephemeral=True)
-            return
-        game["players"].append(interaction.user)
-        count = len(game["players"])
-        await interaction.response.send_message(
-            f"⚔️ **{interaction.user.display_name}** a rejoint ! ({count} joueur{'s' if count > 1 else ''} inscrit{'s' if count > 1 else ''})",
-            ephemeral=False
-        )
-
-    @discord.ui.button(label="🎲 Lancer la partie", style=discord.ButtonStyle.primary, custom_id="lg_start")
-    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
-        game = lg_games.get(self.channel_id)
-        if not game:
-            await interaction.response.send_message("❌ Partie introuvable.", ephemeral=True)
-            return
-        if interaction.user.id != game["host"]:
-            await interaction.response.send_message("❌ Seul l'hôte peut lancer la partie.", ephemeral=True)
-            return
-        if len(game["players"]) < 4:
-            await interaction.response.send_message("❌ Il faut au moins 4 joueurs !", ephemeral=True)
-            return
-        await interaction.response.defer()
-        await lg_start_game(self.channel_id, interaction.channel)
-
-
-async def lg_start_game(channel_id: int, channel):
-    game    = lg_games[channel_id]
-    players = game["players"]
-    roles   = lg_assign_roles(len(players))
-
-    game["roles"]     = {p.id: r for p, r in zip(players, roles)}
-    game["alive"]     = [p.id for p in players]
-    game["phase"]     = "night"
-    game["day"]       = 1
-    game["witch_life"]  = True
-    game["witch_death"] = True
-    game["lover"]       = []
-    game["protected"]   = None
-    game["votes"]       = {}
-
-    # Envoi des rôles en MP
-    wolves = []
-    for player, role in zip(players, roles):
-        e = discord.Embed(
-            title=f"{LG_ROLE_EMOJI[role]} Ton rôle : {role.value}",
-            description=LG_ROLE_DESC[role],
-            color=LG_ROLE_COLOR[role]
-        )
-        e.set_footer(text="🤫 Garde ça secret !")
-        try:
-            await player.send(embed=e)
-        except Exception:
-            pass
-        if role == LGRole.LOUP_GAROU:
-            wolves.append(player.display_name)
-
-    # Annonce loups entre eux
-    if wolves:
-        wolf_players = [p for p in players if game["roles"][p.id] == LGRole.LOUP_GAROU]
-        wolf_names   = ", ".join(f"**{p.display_name}**" for p in wolf_players)
-        for wp in wolf_players:
-            try:
-                await wp.send(f"🐺 Tes alliés loups : {wolf_names}")
-            except Exception:
-                pass
-
-    embed = discord.Embed(
-        title="🌙 La nuit tombe sur le village...",
-        description=(
-            f"**{len(players)} joueurs** ont reçu leur rôle en message privé.\n\n\nLes loups-garous se réveillent et choisissent leur victime...\n\n\n**Composition :**\n" +
-            "\n".join(f"{LG_ROLE_EMOJI[r]} {r.value}" for r in set(roles)) +
-            "\n\n📨 Vérifiez vos messages privés pour connaître votre rôle !"
-        ),
-        color=0x2C2F33
-    )
-    embed.set_footer(text=f"Nuit 1 — Jour {game['day']}")
-    await channel.send(embed=embed)
-    await lg_night_phase(channel_id, channel)
-
-
-async def lg_night_phase(channel_id: int, channel):
-    game = lg_games.get(channel_id)
-    if not game:
-        return
-
-    game["phase"]    = "night"
-    game["votes"]    = {}
-    game["protected"] = None
-    alive_players    = [p for p in game["players"] if p.id in game["alive"]]
-
-    # Liste pour vote loups
-    alive_list = "\n".join(f"• **{p.display_name}**" for p in alive_players)
-
-    # DM aux loups
-    wolf_ids = [uid for uid, r in game["roles"].items() if r == LGRole.LOUP_GAROU and uid in game["alive"]]
-    for uid in wolf_ids:
-        wolf = next((p for p in alive_players if p.id == uid), None)
-        if wolf:
-            e = discord.Embed(
-                title="🐺 Les loups se réveillent...",
-                description=f"Choisissez votre victime parmi les joueurs vivants :\n{alive_list}\n\nUtilise `/lgvote @joueur` dans ce MP ou dans le salon de jeu.",
-                color=0x8B0000
-            )
-            try:
-                await wolf.send(embed=e)
-            except Exception:
-                pass
-
-    # DM voyante
-    voyante = next((p for p in alive_players if game["roles"].get(p.id) == LGRole.VOYANTE), None)
-    if voyante:
-        e = discord.Embed(
-            title="🔮 La Voyante se réveille...",
-            description=f"Tu peux utiliser `/lgvoir @joueur` pour révéler son rôle.\n\nJoueurs vivants :\n{alive_list}",
-            color=0x9B59B6
-        )
-        try:
-            await voyante.send(embed=e)
-        except Exception:
-            pass
-
-    # Cupidon (jour 1 seulement)
-    if game["day"] == 1:
-        cupidon = next((p for p in alive_players if game["roles"].get(p.id) == LGRole.CUPIDON), None)
-        if cupidon and not game["lover"]:
-            e = discord.Embed(
-                title="💘 Cupidon se réveille...",
-                description=f"Utilise `/lglier @joueur1 @joueur2` pour lier deux âmes.\n\nJoueurs :\n{alive_list}",
-                color=0xE91E8C
-            )
-            try:
-                await cupidon.send(embed=e)
-            except Exception:
-                pass
-
-    embed = discord.Embed(
-        title="🌙 Nuit en cours...",
-        description=(
-            "Les rôles spéciaux agissent en messages privés.\n\n🐺 Les loups votent avec `/lgvote @joueur`\n\n🔮 La Voyante utilise `/lgvoir @joueur`\n\n🛡️ Le Salvateur utilise `/lgsauver @joueur`\n\n🧙 La Sorcière utilise `/lgpotion vie|mort @joueur`\n\n\n⏳ Utilisez `/lgnuit` quand tout le monde a joué."
-        ),
-        color=0x2C2F33
-    )
-    embed.set_footer(text=f"Nuit {game['day']}")
-    await channel.send(embed=embed)
-
-
-async def lg_check_win(channel_id: int, channel) -> bool:
-    """Vérifie si la partie est terminée. Retourne True si fin."""
-    game  = lg_games.get(channel_id)
-    if not game:
-        return True
-    alive       = game["alive"]
-    wolf_count  = sum(1 for uid in alive if game["roles"].get(uid) == LGRole.LOUP_GAROU)
-    vill_count  = len(alive) - wolf_count
-
-    if wolf_count == 0:
-        embed = discord.Embed(
-            title="🎉 Le Village a gagné !",
-            description="Tous les loups-garous ont été éliminés ! Le village est sauvé. 🏡",
-            color=0x57F287
-        )
-        embed.add_field(name="Survivants", value="\n".join(
-            f"• {next((p.display_name for p in game['players'] if p.id == uid), str(uid))} — {LG_ROLE_EMOJI[game['roles'][uid]]} {game['roles'][uid].value}"
-            for uid in alive
-        ))
-        await channel.send(embed=embed)
-        del lg_games[channel_id]
-        return True
-    if wolf_count >= vill_count:
-        embed = discord.Embed(
-            title="🐺 Les Loups ont gagné !",
-            description="Les loups-garous ont pris le contrôle du village ! 🌕",
-            color=0x8B0000
-        )
-        await channel.send(embed=embed)
-        del lg_games[channel_id]
-        return True
-    return False
-
-
-@tree.command(name="loupgarou", description="🐺 Lance une partie de Loup-Garou")
-async def slash_loupgarou(interaction: discord.Interaction):
-    ch_id = interaction.channel_id
-    if ch_id in lg_games:
-        await interaction.response.send_message("❌ Une partie est déjà en cours ici !", ephemeral=True)
-        return
-    lg_games[ch_id] = {
-        "host":    interaction.user.id,
-        "players": [interaction.user],
-        "phase":   "lobby",
-        "roles":   {}, "alive": [], "day": 1,
-        "witch_life": True, "witch_death": True,
-        "lover": [], "protected": None, "votes": {},
-        "wolf_vote": {},
-    }
-    embed = discord.Embed(
-        title="🐺 Loup-Garou — Lobby",
-        description=(
-            f"**{interaction.user.display_name}** ouvre une partie de Loup-Garou !\n\n"
-            "🎮 Clique sur **Rejoindre** pour participer.\n"
-            "▶️ L'hôte lance la partie quand tout le monde est prêt.\n\n"
-            "**Minimum 4 joueurs requis.**\n\n"
-            "**Rôles possibles :**\n"
-            "🐺 Loup-Garou | 👨‍🌾 Villageois | 🔮 Voyante\n"
-            "🧙 Sorcière | 🏹 Chasseur | 💘 Cupidon | 🛡️ Salvateur"
-        ),
-        color=0x8B0000
-    )
-    embed.set_footer(text="Le lobby ferme dans 2 minutes.")
-    await interaction.response.send_message(embed=embed, view=LGJoinView(ch_id))
-
-
-@tree.command(name="lgvote", description="🐺 [Loup-Garou] Vote pour dévorer un joueur (loups) ou éliminer (jour)")
-@app_commands.describe(joueur="Joueur ciblé")
-async def slash_lgvote(interaction: discord.Interaction, joueur: discord.Member):
-    ch_id = interaction.channel_id
-    game  = lg_games.get(ch_id)
-    if not game:
-        await interaction.response.send_message("❌ Aucune partie en cours ici.", ephemeral=True)
-        return
-    uid = interaction.user.id
-    if uid not in game["alive"]:
-        await interaction.response.send_message("❌ Tu n'es pas (ou plus) dans la partie.", ephemeral=True)
-        return
-    if joueur.id not in game["alive"]:
-        await interaction.response.send_message("❌ Ce joueur n'est pas en vie.", ephemeral=True)
-        return
-    if joueur.id == uid:
-        await interaction.response.send_message("❌ Tu ne peux pas voter contre toi-même.", ephemeral=True)
-        return
-
-    game["votes"][uid] = joueur.id
-
-    if game["phase"] == "night":
-        role = game["roles"].get(uid)
-        if role != LGRole.LOUP_GAROU:
-            await interaction.response.send_message("❌ Seuls les loups votent la nuit.", ephemeral=True)
-            return
-        wolf_ids    = [i for i in game["alive"] if game["roles"].get(i) == LGRole.LOUP_GAROU]
-        wolves_voted = sum(1 for i in wolf_ids if i in game["votes"])
-        await interaction.response.send_message(
-            f"🐺 Vote enregistré contre **{joueur.display_name}** ({wolves_voted}/{len(wolf_ids)} loups ont voté).",
-            ephemeral=True
-        )
-    else:
-        alive_ids    = game["alive"]
-        voted_count  = len(game["votes"])
-        await interaction.response.send_message(
-            f"🗳️ Vote enregistré contre **{joueur.display_name}** ({voted_count}/{len(alive_ids)} votes).",
-            ephemeral=True
-        )
-
-
-@tree.command(name="lgnuit", description="🌙 [Loup-Garou] Passe à la résolution de nuit")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def slash_lgnuit(interaction: discord.Interaction):
-    await interaction.response.defer()
-    ch_id  = interaction.channel_id
-    game   = lg_games.get(ch_id)
-    if not game or game["phase"] != "night":
-        await interaction.response.send_message("❌ Pas de phase nuit active.", ephemeral=True)
-        return
-
-    # Résolution vote loups
-    wolf_ids = [i for i in game["alive"] if game["roles"].get(i) == LGRole.LOUP_GAROU]
-    wolf_votes = {uid: game["votes"].get(uid) for uid in wolf_ids if game["votes"].get(uid)}
-
-    victim_id = None
-    if wolf_votes:
-        from collections import Counter
-        counts   = Counter(wolf_votes.values())
-        victim_id = counts.most_common(1)[0][0]
-
-    game["votes"] = {}
-    players_map   = {p.id: p for p in game["players"]}
-
-    deaths = []
-    if victim_id and victim_id != game.get("protected"):
-        deaths.append(victim_id)
-
-    # Résolution sorcière (si elle a utilisé ses potions → géré séparément)
-    witch_kill = game.pop("witch_kill_target", None)
-    witch_save = game.pop("witch_save_target", None)
-
-    if witch_save and victim_id in deaths:
-        deaths.remove(victim_id)
-    if witch_kill and witch_kill in game["alive"] and witch_kill not in deaths:
-        deaths.append(witch_kill)
-
-    # Amoureux
-    for uid in list(deaths):
-        for pair in game["lover"]:
-            if uid in pair:
-                other = [x for x in pair if x != uid]
-                for o in other:
-                    if o in game["alive"] and o not in deaths:
-                        deaths.append(o)
-
-    # Annonce
-    embed = discord.Embed(title="🌅 L'aube se lève...", color=0xFFA500, timestamp=datetime.utcnow())
-    if deaths:
-        death_list = "\n".join(
-            f"💀 **{players_map[uid].display_name}** — {LG_ROLE_EMOJI[game['roles'][uid]]} {game['roles'][uid].value}"
-            for uid in deaths if uid in players_map
-        )
-        embed.description = f"Cette nuit, le village pleure ses morts :\n{death_list}"
-        for uid in deaths:
-            if uid in game["alive"]:
-                game["alive"].remove(uid)
-        # Chasseur
-        for uid in deaths:
-            if game["roles"].get(uid) == LGRole.CHASSEUR:
-                embed.description += f"\n\n🏹 **{players_map[uid].display_name}** est le Chasseur ! Il peut emporter quelqu'un avec `/lgchasser @joueur`."
-    else:
-        embed.description = "✨ Miracle ! Personne n'est mort cette nuit."
-
-    game["day"]   += 1
-    game["phase"]  = "day"
-    await interaction.response.send_message(embed=embed)
-
-    if not await lg_check_win(ch_id, interaction.channel):
-        alive_list = "\n".join(f"• **{players_map[uid].display_name}**" for uid in game["alive"])
-        day_embed  = discord.Embed(
-            title=f"☀️ Jour {game['day']} — Le village délibère",
-            description=(
-                f"**{len(game['alive'])} joueurs en vie :**\n{alive_list}\n\n"
-                "🗳️ Votez pour éliminer un suspect avec `/lgvote @joueur`\n"
-                "Quand tout le monde a voté, utilisez `/lgjour` pour résoudre le vote."
-            ),
-            color=0xF0C040
-        )
-        await interaction.channel.send(embed=day_embed)
-
-
-@tree.command(name="lgjour", description="☀️ [Loup-Garou] Résout le vote du jour")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def slash_lgjour(interaction: discord.Interaction):
-    ch_id = interaction.channel_id
-    game  = lg_games.get(ch_id)
-    if not game or game["phase"] != "day":
-        await interaction.response.send_message("❌ Pas de phase jour active.", ephemeral=True)
-        return
-    from collections import Counter
-    votes      = game["votes"]
-    players_map = {p.id: p for p in game["players"]}
-
-    if not votes:
-        await interaction.response.send_message("❌ Personne n'a encore voté !", ephemeral=True)
-        return
-
-    counts  = Counter(votes.values())
-    top_id  = counts.most_common(1)[0][0]
-    role    = game["roles"].get(top_id, LGRole.VILLAGEOIS)
-
-    game["alive"].remove(top_id) if top_id in game["alive"] else None
-    game["votes"] = {}
-    game["phase"] = "night"
-
-    embed = discord.Embed(
-        title="⚖️ Le village a voté !",
-        description=(
-            f"💀 **{players_map[top_id].display_name}** est éliminé !\n"
-            f"Son rôle était : {LG_ROLE_EMOJI[role]} **{role.value}**"
-        ),
-        color=0xE74C3C, timestamp=datetime.utcnow()
-    )
-
-    # Chasseur éliminé de jour
-    if role == LGRole.CHASSEUR:
-        embed.description += f"\n🏹 Il peut emporter quelqu'un avec `/lgchasser @joueur`."
-
-    # Amoureux
-    for pair in game["lover"]:
-        if top_id in pair:
-            for o in pair:
-                if o != top_id and o in game["alive"]:
-                    game["alive"].remove(o)
-                    embed.description += f"\n💔 **{players_map[o].display_name}** meurt de chagrin (amoureux)."
-
-    await interaction.response.send_message(embed=embed)
-
-    if not await lg_check_win(ch_id, interaction.channel):
-        await lg_night_phase(ch_id, interaction.channel)
-
-
-@tree.command(name="lgvoir", description="🔮 [Voyante] Révèle le rôle d'un joueur")
-@app_commands.describe(joueur="Joueur à espionner")
-async def slash_lgvoir(interaction: discord.Interaction, joueur: discord.Member):
-    ch_id = interaction.channel_id
-    game  = lg_games.get(ch_id)
-    if not game:
-        await interaction.response.send_message("❌ Aucune partie en cours.", ephemeral=True)
-        return
-    if game["roles"].get(interaction.user.id) != LGRole.VOYANTE:
-        await interaction.response.send_message("❌ Tu n'es pas la Voyante.", ephemeral=True)
-        return
-    role = game["roles"].get(joueur.id)
-    if not role:
-        await interaction.response.send_message("❌ Ce joueur n'est pas dans la partie.", ephemeral=True)
-        return
-    e = discord.Embed(
-        title="🔮 Vision de la Voyante",
-        description=f"**{joueur.display_name}** est {LG_ROLE_EMOJI[role]} **{role.value}**",
-        color=0x9B59B6
-    )
-    await interaction.response.send_message(embed=e, ephemeral=True)
-
-
-@tree.command(name="lgsauver", description="🛡️ [Salvateur] Protège un joueur cette nuit")
-@app_commands.describe(joueur="Joueur à protéger")
-async def slash_lgsauver(interaction: discord.Interaction, joueur: discord.Member):
-    ch_id = interaction.channel_id
-    game  = lg_games.get(ch_id)
-    if not game or game["roles"].get(interaction.user.id) != LGRole.SALVATEUR:
-        await interaction.response.send_message("❌ Tu n'es pas le Salvateur.", ephemeral=True)
-        return
-    game["protected"] = joueur.id
-    await interaction.response.send_message(f"🛡️ Tu protèges **{joueur.display_name}** cette nuit.", ephemeral=True)
-
-
-@tree.command(name="lgpotion", description="🧙 [Sorcière] Utilise une potion")
-@app_commands.describe(type="vie = sauver la victime, mort = tuer un joueur", joueur="Cible de la potion")
-@app_commands.choices(type=[
-    app_commands.Choice(name="💚 Vie  (sauver la victime des loups)", value="vie"),
-    app_commands.Choice(name="💀 Mort (tuer un joueur)",              value="mort"),
-])
-async def slash_lgpotion(interaction: discord.Interaction, type: str, joueur: discord.Member):
-    ch_id = interaction.channel_id
-    game  = lg_games.get(ch_id)
-    if not game or game["roles"].get(interaction.user.id) != LGRole.SORCIERE:
-        await interaction.response.send_message("❌ Tu n'es pas la Sorcière.", ephemeral=True)
-        return
-    if type == "vie":
-        if not game["witch_life"]:
-            await interaction.response.send_message("❌ Tu as déjà utilisé ta potion de vie.", ephemeral=True)
-            return
-        game["witch_life"]        = False
-        game["witch_save_target"] = joueur.id
-        await interaction.response.send_message(f"💚 Tu as utilisé ta potion de **vie** sur {joueur.mention}.", ephemeral=True)
-    else:
-        if not game["witch_death"]:
-            await interaction.response.send_message("❌ Tu as déjà utilisé ta potion de mort.", ephemeral=True)
-            return
-        game["witch_death"]       = False
-        game["witch_kill_target"] = joueur.id
-        await interaction.response.send_message(f"☠️ Tu as utilisé ta potion de **mort** sur {joueur.mention}.", ephemeral=True)
-
-
-@tree.command(name="lglier", description="💘 [Cupidon] Lie deux joueurs")
-@app_commands.describe(joueur1="Premier amoureux", joueur2="Second amoureux")
-async def slash_lglier(interaction: discord.Interaction, joueur1: discord.Member, joueur2: discord.Member):
-    ch_id = interaction.channel_id
-    game  = lg_games.get(ch_id)
-    if not game or game["roles"].get(interaction.user.id) != LGRole.CUPIDON:
-        await interaction.response.send_message("❌ Tu n'es pas Cupidon.", ephemeral=True)
-        return
-    if game["lover"]:
-        await interaction.response.send_message("❌ Tu as déjà lié deux joueurs.", ephemeral=True)
-        return
-    game["lover"] = [{joueur1.id, joueur2.id}]
-    try:
-        await joueur1.send(f"💘 Tu es lié(e) à **{joueur2.display_name}**. Si l'un de vous meurt, l'autre aussi !")
-        await joueur2.send(f"💘 Tu es lié(e) à **{joueur1.display_name}**. Si l'un de vous meurt, l'autre aussi !")
-    except Exception:
-        pass
-    await interaction.response.send_message(
-        f"💘 Tu as lié **{joueur1.display_name}** et **{joueur2.display_name}**.", ephemeral=True
-    )
-
-
-@tree.command(name="lgchasser", description="🏹 [Chasseur] Emporte quelqu'un avec toi")
-@app_commands.describe(joueur="Joueur à emporter")
-async def slash_lgchasser(interaction: discord.Interaction, joueur: discord.Member):
-    ch_id = interaction.channel_id
-    game  = lg_games.get(ch_id)
-    if not game or game["roles"].get(interaction.user.id) != LGRole.CHASSEUR:
-        await interaction.response.send_message("❌ Tu n'es pas le Chasseur.", ephemeral=True)
-        return
-    if interaction.user.id in game["alive"]:
-        await interaction.response.send_message("❌ Tu dois être mort pour utiliser ce pouvoir.", ephemeral=True)
-        return
-    if joueur.id in game["alive"]:
-        game["alive"].remove(joueur.id)
-    role = game["roles"].get(joueur.id, LGRole.VILLAGEOIS)
-    embed = discord.Embed(
-        title="🏹 Le Chasseur tire !",
-        description=f"💀 **{joueur.display_name}** est emporté par le Chasseur ! Son rôle : {LG_ROLE_EMOJI[role]} **{role.value}**",
-        color=0xE67E22
-    )
-    await interaction.response.send_message(embed=embed)
-    await lg_check_win(ch_id, interaction.channel)
-
-
-@tree.command(name="lgstatus", description="🐺 Affiche l'état de la partie Loup-Garou en cours")
-async def slash_lgstatus(interaction: discord.Interaction):
-    ch_id = interaction.channel_id
-    game  = lg_games.get(ch_id)
-    if not game:
-        await interaction.response.send_message("❌ Aucune partie en cours.", ephemeral=True)
-        return
-    players_map = {p.id: p for p in game["players"]}
-    alive_list  = "\n".join(f"✅ **{players_map[uid].display_name}**" for uid in game["alive"] if uid in players_map)
-    dead_list   = "\n".join(
-        f"💀 {players_map[uid].display_name} — {LG_ROLE_EMOJI[game['roles'][uid]]} {game['roles'][uid].value}"
-        for uid in [p.id for p in game["players"]] if uid not in game["alive"] and uid in players_map
-    )
-    embed = discord.Embed(title="🐺 État de la partie", color=0x8B0000, timestamp=datetime.utcnow())
-    embed.add_field(name=f"🟢 Vivants ({len(game['alive'])})", value=alive_list or "—", inline=False)
-    if dead_list:
-        embed.add_field(name="💀 Éliminés", value=dead_list, inline=False)
-    embed.add_field(name="Phase", value=f"{'☀️ Jour' if game['phase'] == 'day' else '🌙 Nuit'} {game['day']}", inline=True)
-    wolf_count = sum(1 for uid in game["alive"] if game["roles"].get(uid) == LGRole.LOUP_GAROU)
-    embed.add_field(name="Loups restants", value=f"{'❓' * wolf_count}", inline=True)
-    await interaction.response.send_message(embed=embed)
-
-
-@tree.command(name="lgarreter", description="🐺 [Admin] Arrête la partie de Loup-Garou en cours")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def slash_lgarreter(interaction: discord.Interaction):
-    ch_id = interaction.channel_id
-    if ch_id in lg_games:
-        del lg_games[ch_id]
-        await interaction.response.send_message("✅ Partie arrêtée.", ephemeral=True)
-    else:
-        await interaction.response.send_message("❌ Aucune partie en cours.", ephemeral=True)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -5380,6 +4900,16 @@ CV_PUBLISHERS = {
 cv_issue_detail_cache: dict[int, dict] = {}
 cv_volume_publisher_cache: dict[int, dict] = {}
 cv_character_pool_cache: dict[int, dict] = {}
+# Un verrou par éditeur : empêche 10 pulls simultanés de lancer 10 scans ComicVine
+# en parallèle (stampede → rate limit). Le premier charge, les autres attendent.
+_cv_pool_locks: dict[int, asyncio.Lock] = {}
+
+def _cv_pool_lock(publisher_id: int) -> asyncio.Lock:
+    lock = _cv_pool_locks.get(publisher_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _cv_pool_locks[publisher_id] = lock
+    return lock
 
 def _publisher_meta(publisher_id: int) -> dict:
     return CV_PUBLISHERS.get(publisher_id, {"name": "Comics", "emoji": "📚", "color": 0x8B0000, "slug": "all"})
@@ -5821,8 +5351,14 @@ def _format_quest_progress(quest: dict) -> str:
     else:
         progress_txt = str(progress)
         target_txt = str(target)
-    status = "✅" if quest.get("claimed") else ("🎁" if progress >= target else "🕒")
-    return f"{status} **{quest.get('label', 'Quête')}**\n{progress_txt}/{target_txt} • {quest.get('reward', 0)} coins"
+    done = progress >= target
+    status = "✅" if quest.get("claimed") else ("🎁" if done else "🕒")
+    bar = progress_bar(progress, target, length=10)
+    reward_txt = f"+{quest.get('reward', 0)} 🪙"
+    return (
+        f"{status} **{quest.get('label', 'Quête')}**  ·  {reward_txt}\n"
+        f"`{progress_txt}/{target_txt}`  {bar}"
+    )
 
 def _claim_quests(user_id: int, scope: str = "all") -> tuple[int, int]:
     profile = _get_economy_profile(user_id)
@@ -5895,65 +5431,115 @@ def _gacha_rarity_for_index(index: int, total: int) -> str:
         return "Rare"
     return "Commun"
 
-async def _cv_fetch_character_pool(publisher_id: int, max_items: int = GACHA_POOL_SIZE) -> list[dict]:
-    cached = cv_character_pool_cache.get(publisher_id)
-    now_ts = datetime.utcnow().timestamp()
-    if cached and now_ts - cached.get("ts", 0) < 6 * 3600:
-        return cached.get("items", [])
-
-    started_at = datetime.utcnow().timestamp()
-    items: list[dict] = []
-    seen_ids: set[int] = set()
-    # ComicVine expose mal le filtrage par publisher sur /characters, donc on scanne
-    # plusieurs pages triées par popularité puis on filtre localement.
-    scan_limit = max(max_items * 3, 200)
-    for offset in range(0, scan_limit, 100):
-        params = {
-            "sort": "count_of_issue_appearances:desc",
-            "limit": 100,
-            "offset": offset,
-            "field_list": "id,name,real_name,image,deck,site_detail_url,count_of_issue_appearances,publisher",
-        }
-        data = await _cv_request("characters", params)
-        batch = data.get("results") or []
-        if not batch:
-            break
-        for raw in batch:
-            if not _cv_matches_publisher(raw, publisher_id):
-                continue
-            cid = int(raw.get("id") or 0)
-            if not cid or cid in seen_ids:
-                continue
-            seen_ids.add(cid)
-            items.append(
-                {
-                    "id": cid,
-                    "name": raw.get("name") or "Inconnu",
-                    "real_name": raw.get("real_name") or "",
-                    "image": _cv_extract_image(raw.get("image")),
-                    "url": raw.get("site_detail_url") or "",
-                    "desc": _cv_clean_text(raw.get("deck") or "", 220),
-                    "appearances": int(raw.get("count_of_issue_appearances") or 0),
-                    "publisher_id": publisher_id,
-                    "publisher": _publisher_meta(publisher_id)["name"],
-                }
-            )
-            if len(items) >= max_items:
-                break
-        if len(items) >= max_items:
-            break
-        if len(batch) < 100:
-            break
-        await asyncio.sleep(0.25)
-
-    items = items[:max_items]
+def _cv_store_pool(publisher_id: int, items: list[dict]):
+    """Assigne les raretés et met le pool en cache (même partiel)."""
     for index, item in enumerate(items):
         item["rarity"] = _gacha_rarity_for_index(index, len(items))
+    cv_character_pool_cache[publisher_id] = {
+        "ts": datetime.utcnow().timestamp(),
+        "items": items,
+    }
+    mark_data_dirty()
 
-    duration = round(datetime.utcnow().timestamp() - started_at, 2)
-    print(f"ℹ️ Gacha pool { _publisher_meta(publisher_id)['name'] }: {len(items)} personnages chargés en {duration}s")
-    cv_character_pool_cache[publisher_id] = {"ts": now_ts, "items": items}
-    return items
+
+def _cv_pool_is_fresh(publisher_id: int) -> bool:
+    cached = cv_character_pool_cache.get(publisher_id)
+    if not cached:
+        return False
+    return datetime.utcnow().timestamp() - cached.get("ts", 0) < 6 * 3600
+
+
+async def _cv_fetch_character_pool(publisher_id: int, max_items: int = GACHA_POOL_SIZE) -> list[dict]:
+    # Cache frais → réponse immédiate, sans requête réseau.
+    if _cv_pool_is_fresh(publisher_id):
+        return cv_character_pool_cache[publisher_id].get("items", [])
+
+    # Verrou par éditeur : un seul chargement à la fois. Les autres pulls attendent
+    # ici puis récupèrent le cache fraîchement rempli (plus de stampede ComicVine).
+    async with _cv_pool_lock(publisher_id):
+        if _cv_pool_is_fresh(publisher_id):
+            return cv_character_pool_cache[publisher_id].get("items", [])
+
+        started_at = datetime.utcnow().timestamp()
+        items: list[dict] = []
+        seen_ids: set[int] = set()
+        # ComicVine expose mal le filtrage par publisher sur /characters, donc on scanne
+        # plusieurs pages triées par popularité puis on filtre localement.
+        scan_limit = max(max_items * 3, 200)
+        try:
+            for offset in range(0, scan_limit, 100):
+                params = {
+                    "sort": "count_of_issue_appearances:desc",
+                    "limit": 100,
+                    "offset": offset,
+                    "field_list": "id,name,real_name,image,deck,site_detail_url,count_of_issue_appearances,publisher",
+                }
+                data = await _cv_request("characters", params)
+                batch = data.get("results") or []
+                if not batch:
+                    break
+                for raw in batch:
+                    if not _cv_matches_publisher(raw, publisher_id):
+                        continue
+                    cid = int(raw.get("id") or 0)
+                    if not cid or cid in seen_ids:
+                        continue
+                    seen_ids.add(cid)
+                    items.append(
+                        {
+                            "id": cid,
+                            "name": raw.get("name") or "Inconnu",
+                            "real_name": raw.get("real_name") or "",
+                            "image": _cv_extract_image(raw.get("image")),
+                            "url": raw.get("site_detail_url") or "",
+                            "desc": _cv_clean_text(raw.get("deck") or "", 220),
+                            "appearances": int(raw.get("count_of_issue_appearances") or 0),
+                            "publisher_id": publisher_id,
+                            "publisher": _publisher_meta(publisher_id)["name"],
+                        }
+                    )
+                    if len(items) >= max_items:
+                        break
+                # Cache incrémental : si le chargement est annulé (timeout du pull) ou
+                # coupé après cette page, ce qu'on a déjà reste utilisable la fois suivante.
+                if items:
+                    _cv_store_pool(publisher_id, items[:max_items])
+                if len(items) >= max_items:
+                    break
+                if len(batch) < 100:
+                    break
+                await asyncio.sleep(0.25)
+        except asyncio.CancelledError:
+            # Chargement interrompu (timeout du pull) : on garde le partiel déjà mis en cache.
+            if items:
+                _cv_store_pool(publisher_id, items[:max_items])
+            raise
+
+        items = items[:max_items]
+        if not items:
+            # Échec réseau/API : on ressert le dernier cache connu, même périmé.
+            stale = cv_character_pool_cache.get(publisher_id)
+            if stale and stale.get("items"):
+                print(f"⚠️ Gacha pool {_publisher_meta(publisher_id)['name']} : chargement vide, on garde le cache précédent ({len(stale['items'])}).")
+                return stale.get("items", [])
+            return []
+
+        _cv_store_pool(publisher_id, items)
+        duration = round(datetime.utcnow().timestamp() - started_at, 2)
+        print(f"ℹ️ Gacha pool { _publisher_meta(publisher_id)['name'] }: {len(items)} personnages chargés en {duration}s")
+        return items
+
+
+async def _prewarm_gacha_pools():
+    """Charge les pools Marvel & DC en arrière-plan au démarrage, sans bloquer le bot."""
+    for publisher_id in (31, 10):
+        if _cv_pool_is_fresh(publisher_id):
+            continue
+        try:
+            await _cv_fetch_character_pool(publisher_id)
+        except Exception as exc:
+            print(f"⚠️ Pré-chargement pool gacha {_publisher_meta(publisher_id)['name']} échoué : {exc}")
+        await asyncio.sleep(1)
 
 def _gacha_roll_rarity(available_rarities: list[str], pity: int) -> str:
     weights = {
@@ -6016,19 +5602,30 @@ async def slash_quests(interaction: discord.Interaction, membre: discord.Member 
     target = membre or interaction.user
     profile = _get_economy_profile(target.id)
 
+    daily_items = profile["quests"]["daily"]["items"]
+    weekly_items = profile["quests"]["weekly"]["items"]
+    ready = sum(
+        1 for q in (daily_items + weekly_items)
+        if not q.get("claimed") and int(q.get("progress", 0)) >= int(q.get("target", 0))
+    )
+
     embed = discord.Embed(
-        title="🎯 Quêtes du serveur",
-        description=f"Progression de {target.mention}",
-        color=0xF39C12,
+        title="🎯  Tes quêtes",
+        description=(
+            f"Progression de {target.mention}\n"
+            f"💰 Solde : **{fmt_coins(profile.get('coins', 0))}** 🪙"
+            + (f"\n🎁 **{ready} récompense(s)** prête(s) à récupérer !" if ready else "")
+        ),
+        color=BRAND["gold"],
         timestamp=datetime.utcnow(),
     )
-    embed.add_field(name="🪙 Solde", value=f"{int(profile.get('coins', 0))} coins", inline=True)
+    embed.set_thumbnail(url=target.display_avatar.url)
 
-    daily_lines = [_format_quest_progress(quest) for quest in profile["quests"]["daily"]["items"]]
-    weekly_lines = [_format_quest_progress(quest) for quest in profile["quests"]["weekly"]["items"]]
-    embed.add_field(name="☀️ Quotidiennes", value="\n\n".join(daily_lines)[:1024], inline=False)
-    embed.add_field(name="📅 Hebdomadaires", value="\n\n".join(weekly_lines)[:1024], inline=False)
-    embed.set_footer(text="Utilise /claimquests pour récupérer tes récompenses")
+    daily_lines = [_format_quest_progress(quest) for quest in daily_items]
+    weekly_lines = [_format_quest_progress(quest) for quest in weekly_items]
+    embed.add_field(name="☀️ Quotidiennes", value="\n\n".join(daily_lines)[:1024] or "—", inline=False)
+    embed.add_field(name="📅 Hebdomadaires", value="\n\n".join(weekly_lines)[:1024] or "—", inline=False)
+    brand_footer(embed, "/claimquests pour récupérer tes récompenses")
     await interaction.response.send_message(embed=embed, ephemeral=(target == interaction.user))
 
 @tree.command(name="claimquests", description="🎁 Récupère les récompenses de tes quêtes terminées")
@@ -6045,25 +5642,30 @@ async def slash_claim_quests(interaction: discord.Interaction, portee: str = "al
 
     profile = _get_economy_profile(interaction.user.id)
     embed = discord.Embed(
-        title="🎁 Récompenses récupérées",
-        description=f"Tu as validé **{claimed_count} quête(s)**.",
-        color=0x57F287,
+        title="🎁  Récompenses récupérées !",
+        description=f"Tu as validé **{claimed_count} quête(s)** et empoché tes gains.",
+        color=BRAND["success"],
         timestamp=datetime.utcnow(),
     )
-    embed.add_field(name="🪙 Gains", value=f"{total_reward} coins", inline=True)
-    embed.add_field(name="💼 Nouveau solde", value=f"{int(profile.get('coins', 0))} coins", inline=True)
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    embed.add_field(name="💵 Gains", value=f"**+{fmt_coins(total_reward)}** 🪙", inline=True)
+    embed.add_field(name="💼 Nouveau solde", value=f"**{fmt_coins(profile.get('coins', 0))}** 🪙", inline=True)
+    brand_footer(embed, "Continue tes quêtes pour gagner plus")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @tree.command(name="balance", description="🪙 Affiche le solde de coins d'un membre")
 async def slash_balance(interaction: discord.Interaction, membre: discord.Member = None):
     target = membre or interaction.user
     profile = _get_economy_profile(target.id)
+    coins = int(profile.get("coins", 0))
     embed = discord.Embed(
-        title="🪙 Solde",
-        description=f"{target.mention} possède **{int(profile.get('coins', 0))} coins**.",
-        color=0xF1C40F,
+        title="🪙  Portefeuille",
+        description=f"### {fmt_coins(coins)} 🪙\nSolde de {target.mention}",
+        color=BRAND["gold"],
         timestamp=datetime.utcnow(),
     )
+    embed.set_thumbnail(url=target.display_avatar.url)
+    brand_footer(embed, "Gagne des coins avec /quests et les jeux", icon=target.display_avatar.url)
     await interaction.response.send_message(embed=embed, ephemeral=(target == interaction.user))
 
 
@@ -6080,30 +5682,46 @@ async def slash_givecoins(interaction: discord.Interaction, membre: discord.Memb
     save_data()
 
     embed = discord.Embed(
-        title="🪙 Coins ajoutés",
-        description=f"{membre.mention} a reçu **{montant} coins**.",
-        color=0x57F287,
+        title="🪙  Coins crédités",
+        description=f"{membre.mention} a reçu **+{fmt_coins(montant)}** 🪙",
+        color=BRAND["success"],
         timestamp=datetime.utcnow(),
     )
-    embed.add_field(name="💼 Nouveau solde", value=f"{int(profile.get('coins', 0))} coins", inline=True)
-    embed.add_field(name="👤 Donné par", value=interaction.user.mention, inline=True)
+    embed.set_thumbnail(url=membre.display_avatar.url)
+    embed.add_field(name="💼 Nouveau solde", value=f"**{fmt_coins(profile.get('coins', 0))}** 🪙", inline=True)
+    embed.add_field(name="👤 Crédité par", value=interaction.user.mention, inline=True)
+    brand_footer(embed, "Administration", icon=interaction.user.display_avatar.url)
     await interaction.response.send_message(embed=embed)
 
 @tree.command(name="shop", description="🛒 Affiche la boutique du serveur")
 async def slash_shop(interaction: discord.Interaction):
+    profile = _get_economy_profile(interaction.user.id)
+    solde = int(profile.get("coins", 0))
     embed = discord.Embed(
-        title="🛒 Boutique du serveur",
-        description="Achète des boosts, des niveaux et des extras avec tes coins.",
+        title="🛒  Boutique de La Taverne",
+        description=(
+            f"Ton solde : **{fmt_coins(solde)}** 🪙\n"
+            "Dépense tes coins en recharges gacha, niveaux et extras.\n"
+            "​"
+        ),
         color=0x8E44AD,
         timestamp=datetime.utcnow(),
     )
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+
+    # Regroupe les objets par catégorie
+    cats: dict[str, list[str]] = {}
     for item_id, item in SHOP_ITEMS.items():
-        embed.add_field(
-            name=f"{item['label']} — {item['price']} coins",
-            value=f"`{item_id}`\n{item['description']}",
-            inline=False,
+        affordable = "🟢" if solde >= int(item["price"]) else "🔴"
+        line = (
+            f"{item.get('emoji', '•')} **{item['label']}** — `{fmt_coins(item['price'])}` 🪙 {affordable}\n"
+            f"˪ {item['description']}  ·  `/buy {item_id}`"
         )
-    embed.set_footer(text="Utilise /buy pour acheter un objet")
+        cats.setdefault(item.get("cat", "Divers"), []).append(line)
+
+    for cat, lines in cats.items():
+        embed.add_field(name=cat, value="\n".join(lines), inline=False)
+    brand_footer(embed, "🟢 = tu peux te l'offrir  ·  /buy pour acheter")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @tree.command(name="buy", description="🛍️ Achète un objet dans la boutique")
@@ -6263,14 +5881,24 @@ async def slash_gacha_pull(interaction: discord.Interaction, univers: str):
         return
 
     try:
-        pool = await asyncio.wait_for(_cv_fetch_character_pool(publisher_id), timeout=12)
+        pool = await asyncio.wait_for(_cv_fetch_character_pool(publisher_id), timeout=20)
     except asyncio.TimeoutError:
-        await interaction.followup.send(
-            f"❌ Le pool gacha {meta['name']} met trop de temps à charger pour le moment. Réessaie dans quelques secondes."
-        )
-        return
+        # Le chargement continue en tâche de fond et remplit le cache incrémentalement.
+        # Si on a déjà un pool partiel, on l'utilise plutôt que d'échouer.
+        cached = cv_character_pool_cache.get(publisher_id) or {}
+        pool = cached.get("items", [])
+        if not pool:
+            await interaction.followup.send(
+                f"⏳ Le pool gacha {meta['name']} se charge pour la première fois "
+                f"(l'API ComicVine est lente). Réessaie dans ~15 secondes, "
+                f"les personnages seront alors en cache."
+            )
+            return
     if not pool:
-        await interaction.followup.send(f"❌ Impossible de charger le pool gacha {meta['name']} pour le moment.")
+        await interaction.followup.send(
+            f"❌ Impossible de charger le pool gacha {meta['name']} pour le moment "
+            f"(ComicVine indisponible ou clé API invalide). Réessaie plus tard."
+        )
         return
 
     pity_map = profile.setdefault("pity", {})
@@ -6285,6 +5913,7 @@ async def slash_gacha_pull(interaction: discord.Interaction, univers: str):
     key = f"{publisher_id}:{pulled['id']}"
     stored = items.get(key)
     duplicate_count = 1
+    is_new = stored is None
     if stored:
         stored["count"] = int(stored.get("count", 1)) + 1
         duplicate_count = stored["count"]
@@ -6310,32 +5939,50 @@ async def slash_gacha_pull(interaction: discord.Interaction, univers: str):
     _track_quest_progress(interaction.user.id, "gacha_pulls", 1)
     save_data()
 
-    rarity_meta = GACHA_RARITY_META[pulled["rarity"]]
+    rarity = pulled["rarity"]
+    rarity_meta = GACHA_RARITY_META[rarity]
+    is_jackpot = rarity in ("Legendaire", "Mythique")
+
+    # Bannière de rareté (les tirages rares sont mis en scène)
+    name_line = f"**{pulled['name']}**"
+    if pulled.get("real_name"):
+        name_line += f"  ·  *{pulled['real_name']}*"
+    tag = "🆕 NOUVEAU" if is_new else f"×{duplicate_count} (doublon)"
+    banner = f"{rarity_meta['emoji']} **{rarity.upper()}** {rarity_meta['emoji']}" if is_jackpot else f"{rarity_meta['emoji']} {rarity}"
+
     embed = discord.Embed(
-        title=f"{rarity_meta['emoji']} Pull {meta['name']} — {pulled['rarity']}",
-        description=pulled.get("desc") or "Aucune description disponible pour ce personnage.",
+        title=f"{meta['emoji']}  Invocation {meta['name']}",
+        description=(
+            f"{banner}\n"
+            f"## {name_line}\n"
+            f"{tag}\n\n"
+            f"{pulled.get('desc') or '*Aucune description disponible pour ce personnage.*'}"
+        ),
         color=rarity_meta["color"],
         timestamp=datetime.utcnow(),
         url=pulled.get("url") or None,
     )
-    name_line = pulled["name"]
-    if pulled.get("real_name"):
-        name_line += f" ({pulled['real_name']})"
-    embed.add_field(name="🧬 Personnage", value=name_line[:1024], inline=False)
-    embed.add_field(name="📚 Univers", value=meta["name"], inline=True)
-    embed.add_field(name="📖 Apparitions", value=str(pulled.get("appearances", 0)), inline=True)
-    embed.add_field(name="🗂️ Exemplaires", value=str(duplicate_count), inline=True)
-    embed.add_field(name="🎯 Pity", value=f"{pity_map[univers]}/{GACHA_PITY_THRESHOLD}", inline=True)
-    embed.add_field(name="🎟️ Pulls restants", value=f"{pulls_left_after}/{GACHA_PULLS_PER_HOUR}", inline=True)
+    embed.set_author(name=f"Pull de {interaction.user.display_name}", icon_url=interaction.user.display_avatar.url)
+    embed.add_field(name="📖 Apparitions", value=fmt_coins(pulled.get("appearances", 0)), inline=True)
+    embed.add_field(name="🗂️ Exemplaires", value=f"×{duplicate_count}", inline=True)
+    embed.add_field(name="🎯 Pity", value=f"{progress_bar(pity_map[univers], GACHA_PITY_THRESHOLD, 8)}", inline=False)
     if pulled.get("image"):
         embed.set_image(url=pulled["image"])
+
     if pulls_left_after == 0:
         minutes, seconds = divmod(seconds_left_after, 60)
-        footer = f"Gacha {meta['name']} • quota atteint, reset dans {minutes}m {seconds:02d}s"
+        footer = f"{meta['name']} • quota atteint, reset dans {minutes}m {seconds:02d}s"
     else:
-        footer = f"Gacha {meta['name']} • jusqu'à {GACHA_PULLS_PER_HOUR} pulls par heure"
-    embed.set_footer(text=footer)
-    await interaction.followup.send(embed=embed)
+        footer = f"{meta['name']} • {pulls_left_after}/{GACHA_PULLS_PER_HOUR} pulls restants cette heure"
+    brand_footer(embed, footer)
+
+    # Petite mise en scène pour les gros tirages
+    content = None
+    if rarity == "Mythique":
+        content = f"🔥🎉 **{interaction.user.mention} vient d'invoquer un personnage MYTHIQUE !** 🎉🔥"
+    elif rarity == "Legendaire":
+        content = f"🟡✨ {interaction.user.mention} décroche un **Légendaire** !"
+    await interaction.followup.send(content=content, embed=embed)
 
 @tree.command(name="gachacollection", description="📚 Affiche la collection gacha Marvel/DC")
 @app_commands.choices(univers=[
@@ -6374,41 +6021,54 @@ async def slash_gacha_collection(
         counts_by_rarity[item.get("rarity", "Commun")] += int(item.get("count", 1))
         total_copies += int(item.get("count", 1))
 
-    title = "🎴 Collection Gacha"
+    # Couleur selon l'univers filtré, sinon rareté de la meilleure carte
+    top_item = items[0]
+    if publisher_filter:
+        embed_color = _publisher_meta(publisher_filter)["color"]
+    else:
+        embed_color = GACHA_RARITY_META.get(top_item.get("rarity", "Commun"), GACHA_RARITY_META["Commun"])["color"]
+
+    title = "🎴  Collection Gacha"
     if publisher_filter:
         title += f" — {_publisher_meta(publisher_filter)['name']}"
     embed = discord.Embed(
         title=title,
         description=f"Collection de {target.mention}",
-        color=0x8B0000,
+        color=embed_color,
         timestamp=datetime.utcnow(),
     )
-    embed.add_field(name="🧾 Cartes uniques", value=str(len(items)), inline=True)
-    embed.add_field(name="📦 Copies totales", value=str(total_copies), inline=True)
-    embed.add_field(name="🎰 Pulls", value=str(profile.get("pulls", 0)), inline=True)
-    marvel_left, _ = _gacha_window_status(profile, "marvel")
-    dc_left, _ = _gacha_window_status(profile, "dc")
-    embed.add_field(name="🎟️ Marvel", value=f"{marvel_left}/{GACHA_PULLS_PER_HOUR}", inline=True)
-    embed.add_field(name="🎟️ DC", value=f"{dc_left}/{GACHA_PULLS_PER_HOUR}", inline=True)
+    # La carte la plus rare en vedette (miniature) + avatar en auteur
+    embed.set_author(name=target.display_name, icon_url=target.display_avatar.url)
+    if top_item.get("image"):
+        embed.set_thumbnail(url=top_item["image"])
 
+    embed.add_field(name="🧾 Uniques", value=f"**{len(items)}**", inline=True)
+    embed.add_field(name="📦 Copies", value=f"**{total_copies}**", inline=True)
+    embed.add_field(name="🎰 Pulls", value=f"**{profile.get('pulls', 0)}**", inline=True)
+
+    # Raretés sous forme de jauge horizontale
     rarity_summary = []
     for rarity in GACHA_RARITY_ORDER:
         count = counts_by_rarity.get(rarity, 0)
         if count:
-            rarity_summary.append(f"{GACHA_RARITY_META[rarity]['emoji']} {rarity}: {count}")
-    embed.add_field(name="✨ Raretés", value="\n".join(rarity_summary)[:1024], inline=False)
+            rarity_summary.append(f"{GACHA_RARITY_META[rarity]['emoji']} **{rarity}** ×{count}")
+    embed.add_field(name="✨ Raretés possédées", value="  ·  ".join(rarity_summary)[:1024] or "—", inline=False)
 
     lines = []
-    for item in items[:10]:
+    for idx, item in enumerate(items[:10], start=1):
         rarity = item.get("rarity", "Commun")
         emoji = GACHA_RARITY_META.get(rarity, GACHA_RARITY_META["Commun"])["emoji"]
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(idx, f"`{idx:>2}`")
+        real = f" · {item['real_name']}" if item.get("real_name") else ""
         lines.append(
-            f"{emoji} **{item.get('name', 'Inconnu')}** x{int(item.get('count', 1))}"
-            f" • {item.get('publisher', 'Comics')}"
+            f"{medal} {emoji} **{item.get('name', 'Inconnu')}** ×{int(item.get('count', 1))}{real}"
         )
-    embed.add_field(name="🗃️ Top collection", value="\n".join(lines)[:1024], inline=False)
-    if len(items) > 10:
-        embed.set_footer(text=f"{len(items) - 10} carte(s) supplémentaire(s) non affichée(s)")
+    embed.add_field(name="🏆 Meilleures cartes", value="\n".join(lines)[:1024], inline=False)
+
+    marvel_left, _ = _gacha_window_status(profile, "marvel")
+    dc_left, _ = _gacha_window_status(profile, "dc")
+    extra = f" · +{len(items) - 10} autre(s)" if len(items) > 10 else ""
+    brand_footer(embed, f"🔴 {marvel_left}/{GACHA_PULLS_PER_HOUR}  🔵 {dc_left}/{GACHA_PULLS_PER_HOUR} pulls dispo{extra}")
     await interaction.response.send_message(embed=embed)
 
 
@@ -6716,4 +6376,30 @@ async def slash_voler_emoji(interaction: discord.Interaction, emoji: str, nom: s
 
 
 if __name__ == "__main__":
-    bot.run(TOKEN)
+    # ── Vérifications avant lancement (diagnostic clair au lieu d'un crash obscur) ──
+    if not TOKEN or TOKEN == "VOTRE_TOKEN_ICI":
+        print(
+            "❌  DISCORD_TOKEN manquant.\n"
+            "    → Sur Railway : Variables → ajoute DISCORD_TOKEN=<ton_token>\n"
+            "    → En local    : crée un fichier .env avec DISCORD_TOKEN=<ton_token>"
+        )
+        raise SystemExit(1)
+
+    try:
+        bot.run(TOKEN)
+    except discord.PrivilegedIntentsRequired:
+        print(
+            "❌  Intents privilégiés non activés dans le portail Discord.\n"
+            "    Le bot a besoin des 3 intents : PRESENCE, SERVER MEMBERS, MESSAGE CONTENT.\n"
+            "    → https://discord.com/developers/applications → ton appli → Bot →\n"
+            "      section « Privileged Gateway Intents » → active les 3 → Save Changes.\n"
+            "    Puis relance le déploiement."
+        )
+        raise SystemExit(1)
+    except discord.LoginFailure:
+        print(
+            "❌  Token Discord invalide (LoginFailure).\n"
+            "    Le token a peut-être été réinitialisé. Régénère-le dans le portail\n"
+            "    (Bot → Reset Token) et mets à jour la variable DISCORD_TOKEN sur Railway."
+        )
+        raise SystemExit(1)
